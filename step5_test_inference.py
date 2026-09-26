@@ -18,27 +18,27 @@ OUTPUT_MATCHES = "matching_results.tsv"
 
 
 FEATURE_COLUMNS = [
-    "feature_0_name_exact",
-    "feature_1_name_char_sim",
-    "feature_2_name_token_jaccard",
-    "feature_3_name_token_overlap",
-    "feature_4_name_length_ratio",
-    "feature_5_addr_exact",
-    "feature_6_addr_char_sim",
-    "feature_7_addr_token_jaccard",
-    "feature_8_addr_token_overlap",
-    "feature_9_addr_length_ratio",
-    "feature_10_name_prefix4",
-    "feature_11_name_suffix4",
-    "feature_12_name_shared_tokens",
-    "feature_13_name_weighted_overlap",
-    "feature_14_addr_prefix4",
-    "feature_15_addr_suffix4",
-    "feature_16_addr_shared_tokens",
-    "feature_17_addr_weighted_overlap",
-    "feature_18_number_overlap",
-    "feature_19_first_number_match",
-    "feature_20_digit_similarity",
+    "name_exact",
+    "name_char_sim",
+    "name_token_jaccard",
+    "name_token_overlap",
+    "name_length_ratio",
+    "addr_exact",
+    "addr_char_sim",
+    "addr_token_jaccard",
+    "addr_token_overlap",
+    "addr_length_ratio",
+    "name_prefix4",
+    "name_suffix4",
+    "name_shared_tokens",
+    "name_weighted_overlap",
+    "addr_prefix4",
+    "addr_suffix4",
+    "addr_shared_tokens",
+    "addr_weighted_overlap",
+    "number_overlap",
+    "first_number_match",
+    "digit_similarity",
 ]
 
 
@@ -56,6 +56,14 @@ df = pd.read_csv(FEATURE_FILE)
 
 print("Rows:", len(df))
 print("Columns:", len(df.columns))
+# Rename test feature columns to the exact names
+# used when the XGBoost model was trained.
+feature_rename = {
+    f"feature_{i}_{name}": name
+    for i, name in enumerate(FEATURE_COLUMNS)
+}
+
+df = df.rename(columns=feature_rename)
 
 
 # ============================================================
