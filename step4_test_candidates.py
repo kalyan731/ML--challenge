@@ -106,7 +106,7 @@ def main():
                 country_norm
 
             FROM source2,
-            LATERAL unnest(string_split(
+            LATERAL unnest(regexp_split_to_array(
                 lower(coalesce(name_norm, '') || ' ' ||
                       coalesce(addr_norm, '')),
                 '\\s+'
@@ -124,7 +124,7 @@ def main():
                 country_norm
 
             FROM source3,
-            LATERAL unnest(string_split(
+            LATERAL unnest(regexp_split_to_array(
                 lower(coalesce(name_norm, '') || ' ' ||
                       coalesce(addr_norm, '')),
                 '\\s+'
@@ -261,7 +261,7 @@ def main():
 
                 FROM s1_batch,
 
-                LATERAL unnest(string_split(
+                LATERAL unnest(regexp_split_to_array(
                     lower(
                         coalesce(name_norm, '') || ' ' ||
                         coalesce(addr_norm, '')
