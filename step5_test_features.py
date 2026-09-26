@@ -156,8 +156,16 @@ print("=" * 70)
 
 print("\nLoading candidates...")
 
-pairs = pd.read_csv(CANDIDATE_FILE)
-
+pairs = pd.read_csv(
+    CANDIDATE_FILE,
+    header=None,
+    names=[
+        "source1_entity_id",
+        "candidate_entity_id",
+        "candidate_source",
+        "candidate_index",
+    ]
+)
 print("Candidate rows:", len(pairs))
 print("Columns:", list(pairs.columns))
 
