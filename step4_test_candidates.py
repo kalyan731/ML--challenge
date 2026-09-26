@@ -108,7 +108,7 @@ def main():
             FROM source2,
             LATERAL unnest(string_split(
                 lower(coalesce(name_norm, '') || ' ' ||
-                coalesce(addr_norm, '')),
+                      coalesce(addr_norm, '')),
                 '\\s+'
             )) AS t(token)
 
