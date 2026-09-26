@@ -1,10 +1,9 @@
 import os
 import re
-import math
 import difflib
-import duckdb
 import pandas as pd
 import numpy as np
+from collections import Counter
 
 
 # ============================================================
@@ -25,7 +24,7 @@ S3_PATH = os.path.join(CACHE, "source3_normalized.parquet")
 
 
 # ============================================================
-# TEXT HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def safe_text(x):
@@ -36,11 +35,11 @@ def safe_text(x):
     return str(x)
 
 
-def tokens(x):
+def token_set(x):
     x = safe_text(x)
     if not x:
         return set()
-    return set(t for t in x.split() if t)
+    return set(x.split())
 
 
 def char_sim(a, b):
@@ -57,8 +56,8 @@ def char_sim(a, b):
 
 
 def token_jaccard(a, b):
-    ta = tokens(a)
-    tb = tokens(b)
+    ta = token_set(a)
+    tb = token_set(b)
 
     if not ta and not tb:
         return 1.0
@@ -70,8 +69,8 @@ def token_jaccard(a, b):
 
 
 def token_overlap(a, b):
-    ta = tokens(a)
-    tb = tokens(b)
+    ta = token_set(a)
+    tb = token_set(b)
 
     if not ta or not tb:
         return 0.0
@@ -116,42 +115,16 @@ def suffix4(a, b):
 
 
 def shared_tokens(a, b):
-    return float(len(tokens(a) & tokens(b)))
+    return float(len(token_set(a) & token_set(b)))
 
 
-def weighted_overlap(a, b, weights):
-    ta = tokens(a)
-    tb = tokens(b)
-
-    if not ta or not tb:
-        return 0.0
-
-    common = ta & tb
-
-    if not common:
-        return 0.0
-
-    numerator = sum(weights.get(t, 1.0) for t in common)
-
-    denom = min(
-        sum(weights.get(t, 1.0) for t in ta),
-        sum(weights.get(t, 1.0) for t in tb),
-    )
-
-    if denom <= 0:
-        return 0.0
-
-    return numerator / denom
-
-
-def numbers(x):
-    x = safe_text(x)
-    return set(re.findall(r"\d+", x))
+def number_set(x):
+    return set(re.findall(r"\d+", safe_text(x)))
 
 
 def number_overlap(a, b):
-    na = numbers(a)
-    nb = numbers(b)
+    na = number_set(a)
+    nb = number_set(b)
 
     if not na or not nb:
         return 0.0
@@ -183,7 +156,72 @@ def digit_similarity(a, b):
 
 
 # ============================================================
-# LOAD PAIRS
+# WEIGHTED TOKEN OVERLAP
+# ============================================================
+
+def build_weights(records):
+    """
+    Build token weights only from the records actually needed
+    for the current feature-generation run.
+
+    This avoids materializing all tokens from all 12M+ records
+    inside DuckDB.
+    """
+
+    counter = Counter()
+
+    for text in records:
+        counter.update(token_set(text))
+
+    total = max(len(records), 1)
+
+    weights = {}
+
+    for token, freq in counter.items():
+        weights[token] = np.log(
+            (total + 1.0) / (freq + 1.0)
+        )
+
+    return weights
+
+
+def weighted_overlap(a, b, weights):
+    ta = token_set(a)
+    tb = token_set(b)
+
+    if not ta or not tb:
+        return 0.0
+
+    common = ta & tb
+
+    if not common:
+        return 0.0
+
+    numerator = sum(
+        weights.get(t, 1.0)
+        for t in common
+    )
+
+    denom_a = sum(
+        weights.get(t, 1.0)
+        for t in ta
+    )
+
+    denom_b = sum(
+        weights.get(t, 1.0)
+        for t in tb
+    )
+
+    denom = min(denom_a, denom_b)
+
+    if denom <= 0:
+        return 0.0
+
+    return numerator / denom
+
+
+# ============================================================
+# LOAD NORMALIZED RECORDS
 # ============================================================
 
 print("=" * 70)
@@ -200,244 +238,314 @@ print("Valid pairs:", valid_pairs.shape)
 
 
 # ============================================================
-# DUCKDB
+# LOAD NORMALIZED PARQUET FILES
 # ============================================================
 
-print("\nStarting DuckDB...")
+print("\nLoading normalized source files...")
 
-con = duckdb.connect()
+s1 = pd.read_parquet(S1_PATH)
+s2 = pd.read_parquet(S2_PATH)
+s3 = pd.read_parquet(S3_PATH)
 
-con.execute("PRAGMA threads=2")
-con.execute("PRAGMA memory_limit='5GB'")
-con.execute("PRAGMA preserve_insertion_order=false")
-
-
-# ============================================================
-# TOKEN FREQUENCY
-# ============================================================
-
-print("\nBuilding token frequencies for weighted overlap...")
-
-con.execute(f"""
-    CREATE OR REPLACE TEMP TABLE token_frequency AS
-
-    WITH s1_tokens AS (
-        SELECT DISTINCT
-            entity_id,
-            token
-        FROM read_parquet('{S1_PATH}') s
-        CROSS JOIN UNNEST(
-            string_split(
-                TRIM(
-                    CONCAT_WS(
-                        ' ',
-                        COALESCE(s.name_norm, ''),
-                        COALESCE(s.addr_norm, '')
-                    )
-                ),
-                ' '
-            )
-        ) AS t(token)
-        WHERE token <> ''
-    ),
-
-    s2_tokens AS (
-        SELECT DISTINCT
-            entity_id,
-            token
-        FROM read_parquet('{S2_PATH}') s
-        CROSS JOIN UNNEST(
-            string_split(
-                TRIM(
-                    CONCAT_WS(
-                        ' ',
-                        COALESCE(s.name_norm, ''),
-                        COALESCE(s.addr_norm, '')
-                    )
-                ),
-                ' '
-            )
-        ) AS t(token)
-        WHERE token <> ''
-    ),
-
-    s3_tokens AS (
-        SELECT DISTINCT
-            entity_id,
-            token
-        FROM read_parquet('{S3_PATH}') s
-        CROSS JOIN UNNEST(
-            string_split(
-                TRIM(
-                    CONCAT_WS(
-                        ' ',
-                        COALESCE(s.name_norm, ''),
-                        COALESCE(s.addr_norm, '')
-                    )
-                ),
-                ' '
-            )
-        ) AS t(token)
-        WHERE token <> ''
-    ),
-
-    all_tokens AS (
-        SELECT entity_id, token FROM s1_tokens
-        UNION ALL
-        SELECT entity_id, token FROM s2_tokens
-        UNION ALL
-        SELECT entity_id, token FROM s3_tokens
-    )
-
-    SELECT
-        token,
-        COUNT(*) AS freq
-    FROM all_tokens
-    GROUP BY token
-""")
-
-freq_df = con.execute("""
-    SELECT token, freq
-    FROM token_frequency
-""").fetchdf()
-
-print("Unique tokens:", f"{len(freq_df):,}")
-
-# Same weighting idea used by the earlier model.
-weights = {}
-
-for row in freq_df.itertuples(index=False):
-    weights[row.token] = math.log(
-        1000000.0 / (float(row.freq) + 1.0)
-    )
-
-del freq_df
+print("Source1:", s1.shape)
+print("Source2:", s2.shape)
+print("Source3:", s3.shape)
 
 
 # ============================================================
-# FUNCTION TO FETCH RECORDS
+# CREATE CANDIDATE INDEX
 # ============================================================
 
-def prepare_pairs(pairs, name):
+print("\nCreating candidate indexes...")
+
+s2 = s2.reset_index(drop=True)
+s3 = s3.reset_index(drop=True)
+
+s2["candidate_index"] = np.arange(len(s2), dtype=np.int64)
+s3["candidate_index"] = np.arange(len(s3), dtype=np.int64)
+
+
+# ============================================================
+# LOOKUP DICTIONARIES
+# ============================================================
+
+print("\nBuilding lookup dictionaries...")
+
+s1_lookup = {}
+
+for row in s1.itertuples(index=False):
+    s1_lookup[row.entity_id] = row
+
+
+s2_lookup = {}
+
+for row in s2.itertuples(index=False):
+    s2_lookup[row.candidate_index] = row
+
+
+s3_lookup = {}
+
+for row in s3.itertuples(index=False):
+    s3_lookup[row.candidate_index] = row
+
+
+print("S1 lookup:", f"{len(s1_lookup):,}")
+print("S2 lookup:", f"{len(s2_lookup):,}")
+print("S3 lookup:", f"{len(s3_lookup):,}")
+
+
+# ============================================================
+# IMPORTANT:
+# ONLY BUILD TOKEN WEIGHTS FROM PAIRS
+# ============================================================
+
+print("\nBuilding lightweight token weights...")
+
+needed_s1_ids = set(train_pairs["source1_entity_id"])
+needed_s1_ids.update(valid_pairs["source1_entity_id"])
+
+needed_s1_records = []
+
+for entity_id in needed_s1_ids:
+    row = s1_lookup.get(entity_id)
+
+    if row is not None:
+        needed_s1_records.append(
+            safe_text(row.name_norm)
+        )
+        needed_s1_records.append(
+            safe_text(row.addr_norm)
+        )
+
+
+needed_candidate_records = []
+
+all_pairs = pd.concat(
+    [train_pairs, valid_pairs],
+    ignore_index=True
+)
+
+for row in all_pairs.itertuples(index=False):
+
+    candidate_index = int(row.candidate_index)
+
+    if int(row.candidate_source) == 0:
+        cand = s2_lookup.get(candidate_index)
+    else:
+        cand = s3_lookup.get(candidate_index)
+
+    if cand is not None:
+        needed_candidate_records.append(
+            safe_text(cand.name_norm)
+        )
+        needed_candidate_records.append(
+            safe_text(cand.addr_norm)
+        )
+
+
+weights = build_weights(
+    needed_s1_records + needed_candidate_records
+)
+
+print(
+    "Weighted vocabulary:",
+    f"{len(weights):,}"
+)
+
+
+# ============================================================
+# FEATURE GENERATION
+# ============================================================
+
+FEATURE_COLUMNS = [
+
+    "name_exact",
+    "name_char_sim",
+    "name_token_jaccard",
+    "name_token_overlap",
+    "name_length_ratio",
+
+    "addr_exact",
+    "addr_char_sim",
+    "addr_token_jaccard",
+    "addr_token_overlap",
+    "addr_length_ratio",
+
+    "name_prefix4",
+    "name_suffix4",
+    "name_shared_tokens",
+    "name_weighted_overlap",
+
+    "addr_prefix4",
+    "addr_suffix4",
+    "addr_shared_tokens",
+    "addr_weighted_overlap",
+
+    "number_overlap",
+    "first_number_match",
+    "digit_similarity",
+]
+
+
+def generate_features(pairs, split_name):
 
     print("\n" + "-" * 70)
-    print("Preparing", name)
+    print("Generating", split_name, "features")
     print("-" * 70)
 
-    pairs = pairs.copy()
+    output = []
 
-    pairs["_row_id"] = np.arange(len(pairs))
+    total = len(pairs)
 
-    # --------------------------------------------------------
-    # S1 records
-    # --------------------------------------------------------
+    for i, row in enumerate(
+        pairs.itertuples(index=False),
+        start=1
+    ):
 
-    con.register("pair_input", pairs)
+        s1_id = row.source1_entity_id
 
-    s1_df = con.execute(f"""
-        SELECT
-            p._row_id,
+        candidate_index = int(row.candidate_index)
+        candidate_source = int(row.candidate_source)
 
-            s1.entity_id AS source1_entity_id,
-            s1.name_norm AS s1_name,
-            s1.addr_norm AS s1_addr,
-            s1.country_norm AS s1_country
+        s1_row = s1_lookup.get(s1_id)
 
-        FROM pair_input p
-
-        INNER JOIN read_parquet('{S1_PATH}') s1
-            ON s1.entity_id = p.source1_entity_id
-    """).fetchdf()
-
-    # --------------------------------------------------------
-    # Candidate records
-    # --------------------------------------------------------
-
-    s2_df = con.execute(f"""
-        SELECT
-            ROW_NUMBER() OVER () - 1 AS candidate_index,
-            entity_id,
-            name_norm,
-            addr_norm,
-            country_norm
-
-        FROM read_parquet('{S2_PATH}')
-    """).fetchdf()
-
-    s3_df = con.execute(f"""
-        SELECT
-            ROW_NUMBER() OVER () - 1 AS candidate_index,
-            entity_id,
-            name_norm,
-            addr_norm,
-            country_norm
-
-        FROM read_parquet('{S3_PATH}')
-    """).fetchdf()
-
-    # Candidate index lookup.
-    s2_df = s2_df.set_index("candidate_index")
-    s3_df = s3_df.set_index("candidate_index")
-
-    rows = []
-
-    print("Calculating 21 features...")
-
-    for r in pairs.itertuples(index=False):
-
-        row_id = r._row_id
-
-        s1 = s1_df.iloc[row_id]
-
-        s1_name = safe_text(s1.s1_name)
-        s1_addr = safe_text(s1.s1_addr)
-        s1_country = safe_text(s1.s1_country)
-
-        candidate_index = int(r.candidate_index)
-        candidate_source = int(r.candidate_source)
+        if s1_row is None:
+            raise RuntimeError(
+                f"Source1 ID not found: {s1_id}"
+            )
 
         if candidate_source == 0:
-            cand = s2_df.loc[candidate_index]
+            candidate_row = s2_lookup.get(
+                candidate_index
+            )
         else:
-            cand = s3_df.loc[candidate_index]
+            candidate_row = s3_lookup.get(
+                candidate_index
+            )
 
-        c_name = safe_text(cand.name_norm)
-        c_addr = safe_text(cand.addr_norm)
-        c_country = safe_text(cand.country_norm)
+        if candidate_row is None:
+            raise RuntimeError(
+                f"Candidate not found: "
+                f"source={candidate_source}, "
+                f"index={candidate_index}"
+            )
 
-        # ----------------------------------------------------
-        # 21 FEATURES
-        # ----------------------------------------------------
+        s1_name = safe_text(s1_row.name_norm)
+        s1_addr = safe_text(s1_row.addr_norm)
+        s1_country = safe_text(s1_row.country_norm)
 
-        feature_values = [
+        c_name = safe_text(candidate_row.name_norm)
+        c_addr = safe_text(candidate_row.addr_norm)
+        c_country = safe_text(candidate_row.country_norm)
 
-            # Name
+        features = [
+
+            # ------------------------------------------------
+            # NAME
+            # ------------------------------------------------
+
             float(s1_name == c_name),
-            char_sim(s1_name, c_name),
-            token_jaccard(s1_name, c_name),
-            token_overlap(s1_name, c_name),
-            length_ratio(s1_name, c_name),
 
-            # Address
+            char_sim(
+                s1_name,
+                c_name
+            ),
+
+            token_jaccard(
+                s1_name,
+                c_name
+            ),
+
+            token_overlap(
+                s1_name,
+                c_name
+            ),
+
+            length_ratio(
+                s1_name,
+                c_name
+            ),
+
+            # ------------------------------------------------
+            # ADDRESS
+            # ------------------------------------------------
+
             float(s1_addr == c_addr),
-            char_sim(s1_addr, c_addr),
-            token_jaccard(s1_addr, c_addr),
-            token_overlap(s1_addr, c_addr),
-            length_ratio(s1_addr, c_addr),
 
-            # Extra name features
-            prefix4(s1_name, c_name),
-            suffix4(s1_name, c_name),
-            shared_tokens(s1_name, c_name),
-            weighted_overlap(s1_name, c_name, weights),
+            char_sim(
+                s1_addr,
+                c_addr
+            ),
 
-            # Extra address features
-            prefix4(s1_addr, c_addr),
-            suffix4(s1_addr, c_addr),
-            shared_tokens(s1_addr, c_addr),
-            weighted_overlap(s1_addr, c_addr, weights),
+            token_jaccard(
+                s1_addr,
+                c_addr
+            ),
 
-            # Numeric features
+            token_overlap(
+                s1_addr,
+                c_addr
+            ),
+
+            length_ratio(
+                s1_addr,
+                c_addr
+            ),
+
+            # ------------------------------------------------
+            # EXTRA NAME
+            # ------------------------------------------------
+
+            prefix4(
+                s1_name,
+                c_name
+            ),
+
+            suffix4(
+                s1_name,
+                c_name
+            ),
+
+            shared_tokens(
+                s1_name,
+                c_name
+            ),
+
+            weighted_overlap(
+                s1_name,
+                c_name,
+                weights
+            ),
+
+            # ------------------------------------------------
+            # EXTRA ADDRESS
+            # ------------------------------------------------
+
+            prefix4(
+                s1_addr,
+                c_addr
+            ),
+
+            suffix4(
+                s1_addr,
+                c_addr
+            ),
+
+            shared_tokens(
+                s1_addr,
+                c_addr
+            ),
+
+            weighted_overlap(
+                s1_addr,
+                c_addr,
+                weights
+            ),
+
+            # ------------------------------------------------
+            # NUMERIC
+            # ------------------------------------------------
+
             number_overlap(
                 s1_addr,
                 c_addr
@@ -454,69 +562,46 @@ def prepare_pairs(pairs, name):
             ),
         ]
 
-        rows.append(feature_values)
+        output.append(features)
 
-    feature_columns = [
+        if i % 5000 == 0 or i == total:
+            print(
+                f"{split_name}: "
+                f"{i:,}/{total:,}"
+            )
 
-        "name_exact",
-        "name_char_sim",
-        "name_token_jaccard",
-        "name_token_overlap",
-        "name_length_ratio",
-
-        "addr_exact",
-        "addr_char_sim",
-        "addr_token_jaccard",
-        "addr_token_overlap",
-        "addr_length_ratio",
-
-        "name_prefix4",
-        "name_suffix4",
-        "name_shared_tokens",
-        "name_weighted_overlap",
-
-        "addr_prefix4",
-        "addr_suffix4",
-        "addr_shared_tokens",
-        "addr_weighted_overlap",
-
-        "number_overlap",
-        "first_number_match",
-        "digit_similarity",
-    ]
-
-    feature_df = pd.DataFrame(
-        rows,
-        columns=feature_columns
+    result = pd.DataFrame(
+        output,
+        columns=FEATURE_COLUMNS
     )
 
-    # IMPORTANT:
-    # Keep the label separate from the feature matrix.
-    if "label" in pairs.columns:
-        feature_df["label"] = pairs["label"].values
+    result["label"] = pairs["label"].to_numpy()
 
-    print(
-        name,
-        "features:",
-        feature_df.shape
-    )
-
-    return feature_df
+    return result
 
 
 # ============================================================
-# GENERATE FEATURES
+# TRAIN
 # ============================================================
 
-train_features = prepare_pairs(
+train_features = generate_features(
     train_pairs,
     "TRAIN"
 )
 
-valid_features = prepare_pairs(
+print("\nTrain feature shape:", train_features.shape)
+
+
+# ============================================================
+# VALID
+# ============================================================
+
+valid_features = generate_features(
     valid_pairs,
     "VALID"
 )
+
+print("\nValid feature shape:", valid_features.shape)
 
 
 # ============================================================
@@ -535,22 +620,30 @@ valid_features.to_csv(
     index=False
 )
 
+
 print("\nSaved:")
 print(" ", TRAIN_OUT)
 print(" ", VALID_OUT)
 
-print("\nTrain:", train_features.shape)
-print("Valid:", valid_features.shape)
 
-print("\nFeature columns:")
+print("\nFinal feature columns:")
 
-for i, c in enumerate(
-    [c for c in train_features.columns if c != "label"]
-):
-    print(f"  {i}: {c}")
+for i, column in enumerate(FEATURE_COLUMNS):
+    print(
+        f"feature_{i}_{column}"
+    )
+
 
 print("\n" + "=" * 70)
-print("21-FEATURE GENERATION COMPLETE")
+print("STEP 4.3 COMPLETE")
 print("=" * 70)
 
-con.close()
+print(
+    "Train:",
+    train_features.shape
+)
+
+print(
+    "Valid:",
+    valid_features.shape
+)
