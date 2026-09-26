@@ -1,0 +1,57 @@
+# Python
+.venv/
+.venv-1/
+__pycache__/
+*.pyc
+
+# Caches
+normalized_cache/
+normalized_cache_test/
+
+# DuckDB / temporary databases
+*.duckdb
+*.duckdb.tmp
+
+# Large datasets
+*.tsv
+*.csv
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# VS Code / OS
+.vscode/
+.DS_Store
+*.duckdb.wal
+
+# Python environments
+.venv/
+.venv-1/
+__pycache__/
+*.pyc
+
+# Caches
+normalized_cache/
+normalized_cache_test/
+
+# DuckDB / temporary databases
+*.duckdb
+*.duckdb.tmp
+*.duckdb.wal
+
+# Large datasets
+*.tsv
+
+# macOS metadata
+.DS_Store
+__MACOSX/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# VS Code
+.vscode/
