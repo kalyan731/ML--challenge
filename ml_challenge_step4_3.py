@@ -1,79 +1,64 @@
 import os
 import re
-import time
-import numpy as np
+import math
+import difflib
+import duckdb
 import pandas as pd
-
-from rapidfuzz.fuzz import ratio
-from sklearn.linear_model import LogisticRegression
+import numpy as np
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-BASE = r"C:\Users\kulth\OneDrive\ML CHALLENGE"
+TRAIN_PAIRS = "step4_train_pairs.csv"
+VALID_PAIRS = "step4_valid_pairs.csv"
 
-CACHE_DIR = os.path.join(
-    BASE,
-    "normalized_cache",
-)
+TRAIN_OUT = "step4_3_train_features.csv"
+VALID_OUT = "step4_3_valid_features.csv"
 
-S1_CACHE = os.path.join(
-    CACHE_DIR,
-    "source1_normalized.parquet",
-)
+CACHE = "normalized_cache"
 
-S2_CACHE = os.path.join(
-    CACHE_DIR,
-    "source2_normalized.parquet",
-)
-
-S3_CACHE = os.path.join(
-    CACHE_DIR,
-    "source3_normalized.parquet",
-)
-
-TRAIN_PAIRS = os.path.join(
-    BASE,
-    "step4_train_pairs.csv",
-)
-
-VALID_PAIRS = os.path.join(
-    BASE,
-    "step4_valid_pairs.csv",
-)
-
-TRAIN_FEATURES_OUT = os.path.join(
-    BASE,
-    "step4_3_train_features.csv",
-)
-
-VALID_FEATURES_OUT = os.path.join(
-    BASE,
-    "step4_3_valid_features.csv",
-)
-
-MIN_TOKEN_LEN = 2
+S1_PATH = os.path.join(CACHE, "source1_normalized.parquet")
+S2_PATH = os.path.join(CACHE, "source2_normalized.parquet")
+S3_PATH = os.path.join(CACHE, "source3_normalized.parquet")
 
 
 # ============================================================
-# TOKEN FUNCTIONS
+# TEXT HELPERS
 # ============================================================
 
-def get_tokens(text):
+def safe_text(x):
+    if x is None:
+        return ""
+    if pd.isna(x):
+        return ""
+    return str(x)
 
-    return {
-        token
-        for token in str(text).split()
-        if len(token) >= MIN_TOKEN_LEN
-    }
+
+def tokens(x):
+    x = safe_text(x)
+    if not x:
+        return set()
+    return set(t for t in x.split() if t)
+
+
+def char_sim(a, b):
+    a = safe_text(a)
+    b = safe_text(b)
+
+    if not a and not b:
+        return 1.0
+
+    if not a or not b:
+        return 0.0
+
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def token_jaccard(a, b):
-
-    ta = get_tokens(a)
-    tb = get_tokens(b)
+    ta = tokens(a)
+    tb = tokens(b)
 
     if not ta and not tb:
         return 1.0
@@ -85,9 +70,8 @@ def token_jaccard(a, b):
 
 
 def token_overlap(a, b):
-
-    ta = get_tokens(a)
-    tb = get_tokens(b)
+    ta = tokens(a)
+    tb = tokens(b)
 
     if not ta or not tb:
         return 0.0
@@ -96,6 +80,8 @@ def token_overlap(a, b):
 
 
 def length_ratio(a, b):
+    a = safe_text(a)
+    b = safe_text(b)
 
     la = len(a)
     lb = len(b)
@@ -109,20 +95,63 @@ def length_ratio(a, b):
     return min(la, lb) / max(la, lb)
 
 
-def extract_numbers(text):
+def prefix4(a, b):
+    a = safe_text(a)
+    b = safe_text(b)
 
-    return set(
-        re.findall(
-            r"\d+",
-            text,
-        )
+    if len(a) < 4 or len(b) < 4:
+        return 0.0
+
+    return float(a[:4] == b[:4])
+
+
+def suffix4(a, b):
+    a = safe_text(a)
+    b = safe_text(b)
+
+    if len(a) < 4 or len(b) < 4:
+        return 0.0
+
+    return float(a[-4:] == b[-4:])
+
+
+def shared_tokens(a, b):
+    return float(len(tokens(a) & tokens(b)))
+
+
+def weighted_overlap(a, b, weights):
+    ta = tokens(a)
+    tb = tokens(b)
+
+    if not ta or not tb:
+        return 0.0
+
+    common = ta & tb
+
+    if not common:
+        return 0.0
+
+    numerator = sum(weights.get(t, 1.0) for t in common)
+
+    denom = min(
+        sum(weights.get(t, 1.0) for t in ta),
+        sum(weights.get(t, 1.0) for t in tb),
     )
+
+    if denom <= 0:
+        return 0.0
+
+    return numerator / denom
+
+
+def numbers(x):
+    x = safe_text(x)
+    return set(re.findall(r"\d+", x))
 
 
 def number_overlap(a, b):
-
-    na = extract_numbers(a)
-    nb = extract_numbers(b)
+    na = numbers(a)
+    nb = numbers(b)
 
     if not na or not nb:
         return 0.0
@@ -131,899 +160,397 @@ def number_overlap(a, b):
 
 
 def first_number_match(a, b):
-
-    na = extract_numbers(a)
-    nb = extract_numbers(b)
+    na = re.findall(r"\d+", safe_text(a))
+    nb = re.findall(r"\d+", safe_text(b))
 
     if not na or not nb:
         return 0.0
 
-    return float(
-        next(iter(na)) in nb
-    )
+    return float(na[0] == nb[0])
 
 
-# ============================================================
-# ADDITIONAL FEATURES
-# ============================================================
+def digit_similarity(a, b):
+    a = re.sub(r"\D", "", safe_text(a))
+    b = re.sub(r"\D", "", safe_text(b))
 
-def prefix_similarity(a, b, n=4):
-
-    if not a or not b:
-        return 0.0
-
-    return float(
-        a[:n] == b[:n]
-    )
-
-
-def suffix_similarity(a, b, n=4):
+    if not a and not b:
+        return 1.0
 
     if not a or not b:
         return 0.0
 
-    return float(
-        a[-n:] == b[-n:]
-    )
-
-
-def shared_token_count(a, b):
-
-    ta = get_tokens(a)
-    tb = get_tokens(b)
-
-    return float(
-        len(ta & tb)
-    )
-
-
-def weighted_token_overlap(a, b):
-
-    ta = get_tokens(a)
-    tb = get_tokens(b)
-
-    if not ta or not tb:
-        return 0.0
-
-    shared = ta & tb
-
-    # Rare-token proxy:
-    # longer tokens receive slightly more weight.
-    total_weight = sum(
-        np.log1p(len(t))
-        for t in ta
-    )
-
-    if total_weight == 0:
-        return 0.0
-
-    shared_weight = sum(
-        np.log1p(len(t))
-        for t in shared
-    )
-
-    return shared_weight / total_weight
-
-
-def digit_string_similarity(a, b):
-
-    da = "".join(
-        re.findall(r"\d+", a)
-    )
-
-    db = "".join(
-        re.findall(r"\d+", b)
-    )
-
-    if not da or not db:
-        return 0.0
-
-    return ratio(da, db) / 100.0
-
-
-# ============================================================
-# F0.5
-# ============================================================
-
-def f05_score(y_true, y_pred):
-
-    tp = np.sum(
-        (y_true == 1) &
-        (y_pred == 1)
-    )
-
-    fp = np.sum(
-        (y_true == 0) &
-        (y_pred == 1)
-    )
-
-    fn = np.sum(
-        (y_true == 1) &
-        (y_pred == 0)
-    )
-
-    if tp + fp == 0:
-        precision = 0.0
-    else:
-        precision = tp / (tp + fp)
-
-    if tp + fn == 0:
-        recall = 0.0
-    else:
-        recall = tp / (tp + fn)
-
-    if precision == 0.0 and recall == 0.0:
-        return 0.0, precision, recall
-
-    score = (
-        1.25
-        * precision
-        * recall
-        / (0.25 * precision + recall)
-    )
-
-    return score, precision, recall
-
-
-# ============================================================
-# START
-# ============================================================
-
-start = time.time()
-
-print("=" * 75)
-print("STEP 4.3 - CACHED FEATURES + STRONGER BASELINE")
-print("=" * 75)
-
-
-# ============================================================
-# LOAD CACHED DATA
-# ============================================================
-
-print("\nLoading normalized Parquet cache...")
-
-cache_start = time.time()
-
-s1 = pd.read_parquet(
-    S1_CACHE,
-)
-
-print(
-    f"S1 loaded: {s1.shape}"
-)
-
-s2 = pd.read_parquet(
-    S2_CACHE,
-)
-
-print(
-    f"S2 loaded: {s2.shape}"
-)
-
-s3 = pd.read_parquet(
-    S3_CACHE,
-)
-
-print(
-    f"S3 loaded: {s3.shape}"
-)
-
-print(
-    f"Cache load time: "
-    f"{time.time() - cache_start:.2f}s"
-)
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 # ============================================================
 # LOAD PAIRS
 # ============================================================
 
+print("=" * 70)
+print("STEP 4.3 - 21 FEATURE GENERATION")
+print("=" * 70)
+
 print("\nLoading pair files...")
 
-train_pairs = pd.read_csv(
-    TRAIN_PAIRS,
-)
+train_pairs = pd.read_csv(TRAIN_PAIRS)
+valid_pairs = pd.read_csv(VALID_PAIRS)
 
-valid_pairs = pd.read_csv(
-    VALID_PAIRS,
-)
-
-print(
-    f"Train pairs: {train_pairs.shape}"
-)
-
-print(
-    f"Valid pairs: {valid_pairs.shape}"
-)
+print("Train pairs:", train_pairs.shape)
+print("Valid pairs:", valid_pairs.shape)
 
 
 # ============================================================
-# VALIDATE SCHEMA
+# DUCKDB
 # ============================================================
 
-required_pair_cols = {
-    "source1_entity_id",
-    "candidate_entity_id",
-    "candidate_source",
-    "candidate_index",
-    "label",
-}
+print("\nStarting DuckDB...")
 
-for name, df in {
-    "train": train_pairs,
-    "valid": valid_pairs,
-}.items():
+con = duckdb.connect()
 
-    missing = (
-        required_pair_cols
-        - set(df.columns)
+con.execute("PRAGMA threads=2")
+con.execute("PRAGMA memory_limit='5GB'")
+con.execute("PRAGMA preserve_insertion_order=false")
+
+
+# ============================================================
+# TOKEN FREQUENCY
+# ============================================================
+
+print("\nBuilding token frequencies for weighted overlap...")
+
+con.execute(f"""
+    CREATE OR REPLACE TEMP TABLE token_frequency AS
+
+    WITH s1_tokens AS (
+        SELECT DISTINCT
+            entity_id,
+            token
+        FROM read_parquet('{S1_PATH}') s
+        CROSS JOIN UNNEST(
+            string_split(
+                TRIM(
+                    CONCAT_WS(
+                        ' ',
+                        COALESCE(s.name_norm, ''),
+                        COALESCE(s.addr_norm, '')
+                    )
+                ),
+                ' '
+            )
+        ) AS t(token)
+        WHERE token <> ''
+    ),
+
+    s2_tokens AS (
+        SELECT DISTINCT
+            entity_id,
+            token
+        FROM read_parquet('{S2_PATH}') s
+        CROSS JOIN UNNEST(
+            string_split(
+                TRIM(
+                    CONCAT_WS(
+                        ' ',
+                        COALESCE(s.name_norm, ''),
+                        COALESCE(s.addr_norm, '')
+                    )
+                ),
+                ' '
+            )
+        ) AS t(token)
+        WHERE token <> ''
+    ),
+
+    s3_tokens AS (
+        SELECT DISTINCT
+            entity_id,
+            token
+        FROM read_parquet('{S3_PATH}') s
+        CROSS JOIN UNNEST(
+            string_split(
+                TRIM(
+                    CONCAT_WS(
+                        ' ',
+                        COALESCE(s.name_norm, ''),
+                        COALESCE(s.addr_norm, '')
+                    )
+                ),
+                ' '
+            )
+        ) AS t(token)
+        WHERE token <> ''
+    ),
+
+    all_tokens AS (
+        SELECT entity_id, token FROM s1_tokens
+        UNION ALL
+        SELECT entity_id, token FROM s2_tokens
+        UNION ALL
+        SELECT entity_id, token FROM s3_tokens
     )
 
-    if missing:
-        raise ValueError(
-            f"{name} pair file missing: "
-            f"{sorted(missing)}"
-        )
+    SELECT
+        token,
+        COUNT(*) AS freq
+    FROM all_tokens
+    GROUP BY token
+""")
+
+freq_df = con.execute("""
+    SELECT token, freq
+    FROM token_frequency
+""").fetchdf()
+
+print("Unique tokens:", f"{len(freq_df):,}")
+
+# Same weighting idea used by the earlier model.
+weights = {}
+
+for row in freq_df.itertuples(index=False):
+    weights[row.token] = math.log(
+        1000000.0 / (float(row.freq) + 1.0)
+    )
+
+del freq_df
 
 
 # ============================================================
-# DIRECT S1 LOOKUP
+# FUNCTION TO FETCH RECORDS
 # ============================================================
 
-print("\nCreating Source1 ID lookup...")
+def prepare_pairs(pairs, name):
 
-s1_id_to_idx = pd.Series(
-    s1.index,
-    index=s1["entity_id"],
-).to_dict()
+    print("\n" + "-" * 70)
+    print("Preparing", name)
+    print("-" * 70)
 
-print(
-    f"S1 IDs: {len(s1_id_to_idx):,}"
-)
+    pairs = pairs.copy()
 
+    pairs["_row_id"] = np.arange(len(pairs))
 
-# ============================================================
-# ARRAYS
-# ============================================================
+    # --------------------------------------------------------
+    # S1 records
+    # --------------------------------------------------------
 
-s1_name = s1["name_norm"].to_numpy()
-s1_addr = s1["addr_norm"].to_numpy()
+    con.register("pair_input", pairs)
 
-s2_name = s2["name_norm"].to_numpy()
-s2_addr = s2["addr_norm"].to_numpy()
+    s1_df = con.execute(f"""
+        SELECT
+            p._row_id,
 
-s3_name = s3["name_norm"].to_numpy()
-s3_addr = s3["addr_norm"].to_numpy()
+            s1.entity_id AS source1_entity_id,
+            s1.name_norm AS s1_name,
+            s1.addr_norm AS s1_addr,
+            s1.country_norm AS s1_country
 
+        FROM pair_input p
 
-# ============================================================
-# FEATURE NAMES
-# ============================================================
+        INNER JOIN read_parquet('{S1_PATH}') s1
+            ON s1.entity_id = p.source1_entity_id
+    """).fetchdf()
 
-FEATURE_NAMES = [
+    # --------------------------------------------------------
+    # Candidate records
+    # --------------------------------------------------------
 
-    "name_exact",
+    s2_df = con.execute(f"""
+        SELECT
+            ROW_NUMBER() OVER () - 1 AS candidate_index,
+            entity_id,
+            name_norm,
+            addr_norm,
+            country_norm
 
-    "name_char_sim",
+        FROM read_parquet('{S2_PATH}')
+    """).fetchdf()
 
-    "name_token_jaccard",
+    s3_df = con.execute(f"""
+        SELECT
+            ROW_NUMBER() OVER () - 1 AS candidate_index,
+            entity_id,
+            name_norm,
+            addr_norm,
+            country_norm
 
-    "name_token_overlap",
+        FROM read_parquet('{S3_PATH}')
+    """).fetchdf()
 
-    "name_length_ratio",
-
-    "name_prefix4",
-
-    "name_suffix4",
-
-    "name_shared_tokens",
-
-    "name_weighted_overlap",
-
-    "addr_exact",
-
-    "addr_char_sim",
-
-    "addr_token_jaccard",
-
-    "addr_token_overlap",
-
-    "addr_length_ratio",
-
-    "addr_prefix4",
-
-    "addr_suffix4",
-
-    "addr_shared_tokens",
-
-    "addr_weighted_overlap",
-
-    "number_overlap",
-
-    "first_number_match",
-
-    "digit_similarity",
-
-]
-
-
-# ============================================================
-# BUILD FEATURES
-# ============================================================
-
-def build_features(pairs):
+    # Candidate index lookup.
+    s2_df = s2_df.set_index("candidate_index")
+    s3_df = s3_df.set_index("candidate_index")
 
     rows = []
 
-    total = len(pairs)
+    print("Calculating 21 features...")
 
-    for pos, row in enumerate(
-        pairs.itertuples(index=False),
-        start=1,
-    ):
+    for r in pairs.itertuples(index=False):
 
-        s1_id = row.source1_entity_id
+        row_id = r._row_id
 
-        source = int(
-            row.candidate_source
-        )
+        s1 = s1_df.iloc[row_id]
 
-        candidate_idx = int(
-            row.candidate_index
-        )
+        s1_name = safe_text(s1.s1_name)
+        s1_addr = safe_text(s1.s1_addr)
+        s1_country = safe_text(s1.s1_country)
 
-        s1_idx = s1_id_to_idx.get(
-            s1_id
-        )
+        candidate_index = int(r.candidate_index)
+        candidate_source = int(r.candidate_source)
 
-        if s1_idx is None:
-            raise ValueError(
-                f"S1 ID not found: {s1_id}"
-            )
-
-        n1 = s1_name[s1_idx]
-        a1 = s1_addr[s1_idx]
-
-        if source == 0:
-
-            if (
-                candidate_idx < 0
-                or candidate_idx >= len(s2)
-            ):
-                raise IndexError(
-                    f"Invalid S2 index: "
-                    f"{candidate_idx}"
-                )
-
-            n2 = s2_name[candidate_idx]
-            a2 = s2_addr[candidate_idx]
-
-        elif source == 1:
-
-            if (
-                candidate_idx < 0
-                or candidate_idx >= len(s3)
-            ):
-                raise IndexError(
-                    f"Invalid S3 index: "
-                    f"{candidate_idx}"
-                )
-
-            n2 = s3_name[candidate_idx]
-            a2 = s3_addr[candidate_idx]
-
+        if candidate_source == 0:
+            cand = s2_df.loc[candidate_index]
         else:
+            cand = s3_df.loc[candidate_index]
 
-            raise ValueError(
-                f"Invalid candidate_source: "
-                f"{source}"
-            )
+        c_name = safe_text(cand.name_norm)
+        c_addr = safe_text(cand.addr_norm)
+        c_country = safe_text(cand.country_norm)
 
-        row_features = [
+        # ----------------------------------------------------
+        # 21 FEATURES
+        # ----------------------------------------------------
 
-            # NAME
-            float(
-                n1 == n2
-                and n1 != ""
-            ),
+        feature_values = [
 
-            ratio(
-                n1,
-                n2,
-            ) / 100.0,
+            # Name
+            float(s1_name == c_name),
+            char_sim(s1_name, c_name),
+            token_jaccard(s1_name, c_name),
+            token_overlap(s1_name, c_name),
+            length_ratio(s1_name, c_name),
 
-            token_jaccard(
-                n1,
-                n2,
-            ),
+            # Address
+            float(s1_addr == c_addr),
+            char_sim(s1_addr, c_addr),
+            token_jaccard(s1_addr, c_addr),
+            token_overlap(s1_addr, c_addr),
+            length_ratio(s1_addr, c_addr),
 
-            token_overlap(
-                n1,
-                n2,
-            ),
+            # Extra name features
+            prefix4(s1_name, c_name),
+            suffix4(s1_name, c_name),
+            shared_tokens(s1_name, c_name),
+            weighted_overlap(s1_name, c_name, weights),
 
-            length_ratio(
-                n1,
-                n2,
-            ),
+            # Extra address features
+            prefix4(s1_addr, c_addr),
+            suffix4(s1_addr, c_addr),
+            shared_tokens(s1_addr, c_addr),
+            weighted_overlap(s1_addr, c_addr, weights),
 
-            prefix_similarity(
-                n1,
-                n2,
-            ),
-
-            suffix_similarity(
-                n1,
-                n2,
-            ),
-
-            shared_token_count(
-                n1,
-                n2,
-            ),
-
-            weighted_token_overlap(
-                n1,
-                n2,
-            ),
-
-            # ADDRESS
-            float(
-                a1 == a2
-                and a1 != ""
-            ),
-
-            ratio(
-                a1,
-                a2,
-            ) / 100.0,
-
-            token_jaccard(
-                a1,
-                a2,
-            ),
-
-            token_overlap(
-                a1,
-                a2,
-            ),
-
-            length_ratio(
-                a1,
-                a2,
-            ),
-
-            prefix_similarity(
-                a1,
-                a2,
-            ),
-
-            suffix_similarity(
-                a1,
-                a2,
-            ),
-
-            shared_token_count(
-                a1,
-                a2,
-            ),
-
-            weighted_token_overlap(
-                a1,
-                a2,
-            ),
-
-            # NUMBERS
+            # Numeric features
             number_overlap(
-                a1,
-                a2,
+                s1_addr,
+                c_addr
             ),
 
             first_number_match(
-                a1,
-                a2,
+                s1_addr,
+                c_addr
             ),
 
-            digit_string_similarity(
-                a1,
-                a2,
+            digit_similarity(
+                s1_addr,
+                c_addr
             ),
         ]
 
-        rows.append(
-            row_features
-        )
+        rows.append(feature_values)
 
-        if (
-            pos % 5000 == 0
-            or pos == total
-        ):
+    feature_columns = [
 
-            print(
-                f"Features: "
-                f"{pos:,}/{total:,}"
-            )
+        "name_exact",
+        "name_char_sim",
+        "name_token_jaccard",
+        "name_token_overlap",
+        "name_length_ratio",
 
-    return np.asarray(
-        rows,
-        dtype=np.float32,
-    )
+        "addr_exact",
+        "addr_char_sim",
+        "addr_token_jaccard",
+        "addr_token_overlap",
+        "addr_length_ratio",
 
+        "name_prefix4",
+        "name_suffix4",
+        "name_shared_tokens",
+        "name_weighted_overlap",
 
-# ============================================================
-# TRAIN FEATURES
-# ============================================================
+        "addr_prefix4",
+        "addr_suffix4",
+        "addr_shared_tokens",
+        "addr_weighted_overlap",
 
-print(
-    "\nBuilding training features..."
-)
-
-X_train = build_features(
-    train_pairs
-)
-
-y_train = train_pairs[
-    "label"
-].to_numpy(
-    dtype=np.int8
-)
-
-print(
-    f"Training matrix: "
-    f"{X_train.shape}"
-)
-
-
-# ============================================================
-# VALID FEATURES
-# ============================================================
-
-print(
-    "\nBuilding validation features..."
-)
-
-X_valid = build_features(
-    valid_pairs
-)
-
-y_valid = valid_pairs[
-    "label"
-].to_numpy(
-    dtype=np.int8
-)
-
-print(
-    f"Validation matrix: "
-    f"{X_valid.shape}"
-)
-
-
-# ============================================================
-# FEATURE SUMMARY
-# ============================================================
-
-print(
-    "\nFeature summary:"
-)
-
-for i, name in enumerate(
-    FEATURE_NAMES
-):
-
-    print(
-        f"{name:25s} "
-        f"mean={X_train[:, i].mean():.4f} "
-        f"min={X_train[:, i].min():.4f} "
-        f"max={X_train[:, i].max():.4f}"
-    )
-
-
-# ============================================================
-# MODEL
-# ============================================================
-
-print(
-    "\nTraining Logistic Regression..."
-)
-
-model = LogisticRegression(
-    max_iter=1500,
-    class_weight="balanced",
-    solver="lbfgs",
-)
-
-model.fit(
-    X_train,
-    y_train,
-)
-
-print(
-    "Model trained."
-)
-
-
-# ============================================================
-# PROBABILITIES
-# ============================================================
-
-print(
-    "\nPredicting validation..."
-)
-
-valid_prob = model.predict_proba(
-    X_valid
-)[:, 1]
-
-
-# ============================================================
-# THRESHOLD SEARCH
-# ============================================================
-
-print(
-    "\nSearching F0.5 threshold..."
-)
-
-best_threshold = 0.0
-best_score = -1.0
-best_precision = 0.0
-best_recall = 0.0
-
-for threshold in np.arange(
-    0.10,
-    0.991,
-    0.01,
-):
-
-    pred = (
-        valid_prob >= threshold
-    ).astype(np.int8)
-
-    score, precision, recall = (
-        f05_score(
-            y_valid,
-            pred,
-        )
-    )
-
-    if score > best_score:
-
-        best_score = score
-        best_threshold = float(
-            threshold
-        )
-        best_precision = precision
-        best_recall = recall
-
-
-# ============================================================
-# ROW LEVEL RESULT
-# ============================================================
-
-print(
-    "\n" + "=" * 75
-)
-
-print(
-    "STEP 4.3 RESULTS"
-)
-
-print(
-    "=" * 75
-)
-
-print(
-    f"Best threshold: "
-    f"{best_threshold:.2f}"
-)
-
-print(
-    f"Precision:       "
-    f"{best_precision:.6f}"
-)
-
-print(
-    f"Recall:          "
-    f"{best_recall:.6f}"
-)
-
-print(
-    f"Pair-level F0.5:  "
-    f"{best_score:.6f}"
-)
-
-
-# ============================================================
-# ENTITY-LEVEL EVALUATION
-# ============================================================
-
-print(
-    "\nCalculating entity-level F0.5..."
-)
-
-valid_eval = valid_pairs.copy()
-
-valid_eval[
-    "probability"
-] = valid_prob
-
-valid_eval[
-    "prediction"
-] = (
-    valid_eval[
-        "probability"
+        "number_overlap",
+        "first_number_match",
+        "digit_similarity",
     ]
-    >= best_threshold
-).astype(np.int8)
 
-
-entity_scores = []
-
-for source1_id, group in (
-    valid_eval.groupby(
-        "source1_entity_id",
-        sort=False,
-    )
-):
-
-    true_labels = group[
-        "label"
-    ].to_numpy(
-        dtype=np.int8
+    feature_df = pd.DataFrame(
+        rows,
+        columns=feature_columns
     )
 
-    predicted_labels = group[
-        "prediction"
-    ].to_numpy(
-        dtype=np.int8
-    )
-
-    score, _, _ = f05_score(
-        true_labels,
-        predicted_labels,
-    )
-
-    entity_scores.append(
-        score
-    )
-
-
-entity_f05 = float(
-    np.mean(entity_scores)
-)
-
-print(
-    f"Validation entities: "
-    f"{len(entity_scores):,}"
-)
-
-print(
-    f"Entity-level macro F0.5: "
-    f"{entity_f05:.6f}"
-)
-
-
-# ============================================================
-# COMPARE BASELINE
-# ============================================================
-
-BASELINE = 0.865432
-
-print(
-    "\nComparison with Step 4.2:"
-)
-
-print(
-    f"Previous baseline: "
-    f"{BASELINE:.6f}"
-)
-
-print(
-    f"Step 4.3:          "
-    f"{entity_f05:.6f}"
-)
-
-print(
-    f"Difference:        "
-    f"{entity_f05 - BASELINE:+.6f}"
-)
-
-
-# ============================================================
-# COEFFICIENTS
-# ============================================================
-
-print(
-    "\nModel coefficients:"
-)
-
-coefficients = model.coef_[0]
-
-for name, coefficient in sorted(
-    zip(
-        FEATURE_NAMES,
-        coefficients,
-    ),
-    key=lambda x: abs(x[1]),
-    reverse=True,
-):
+    # IMPORTANT:
+    # Keep the label separate from the feature matrix.
+    if "label" in pairs.columns:
+        feature_df["label"] = pairs["label"].values
 
     print(
-        f"{name:25s}"
-        f"{coefficient:+.6f}"
+        name,
+        "features:",
+        feature_df.shape
     )
 
+    return feature_df
+
 
 # ============================================================
-# SAVE FEATURES
+# GENERATE FEATURES
 # ============================================================
 
-print(
-    "\nSaving feature matrices..."
+train_features = prepare_pairs(
+    train_pairs,
+    "TRAIN"
 )
 
-feature_columns = [
-    f"feature_{i}_{name}"
-    for i, name in enumerate(
-        FEATURE_NAMES
-    )
-]
-
-train_feature_df = pd.DataFrame(
-    X_train,
-    columns=feature_columns,
-)
-
-train_feature_df[
-    "label"
-] = y_train
-
-valid_feature_df = pd.DataFrame(
-    X_valid,
-    columns=feature_columns,
-)
-
-valid_feature_df[
-    "label"
-] = y_valid
-
-train_feature_df.to_csv(
-    TRAIN_FEATURES_OUT,
-    index=False,
-)
-
-valid_feature_df.to_csv(
-    VALID_FEATURES_OUT,
-    index=False,
-)
-
-print(
-    f"Saved: {TRAIN_FEATURES_OUT}"
-)
-
-print(
-    f"Saved: {VALID_FEATURES_OUT}"
+valid_features = prepare_pairs(
+    valid_pairs,
+    "VALID"
 )
 
 
 # ============================================================
-# DONE
+# SAVE
 # ============================================================
 
-elapsed = time.time() - start
+print("\nSaving feature files...")
 
-print(
-    "\nTotal runtime: "
-    f"{elapsed:.2f} seconds"
+train_features.to_csv(
+    TRAIN_OUT,
+    index=False
 )
 
-print(
-    "=" * 75
+valid_features.to_csv(
+    VALID_OUT,
+    index=False
 )
 
-print(
-    "DONE"
-)
+print("\nSaved:")
+print(" ", TRAIN_OUT)
+print(" ", VALID_OUT)
 
-print(
-    "=" * 75
-)
+print("\nTrain:", train_features.shape)
+print("Valid:", valid_features.shape)
+
+print("\nFeature columns:")
+
+for i, c in enumerate(
+    [c for c in train_features.columns if c != "label"]
+):
+    print(f"  {i}: {c}")
+
+print("\n" + "=" * 70)
+print("21-FEATURE GENERATION COMPLETE")
+print("=" * 70)
+
+con.close()
