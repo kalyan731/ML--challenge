@@ -1,195 +1,210 @@
-import time
-from pathlib import Path
-
+import os
+import json
 import numpy as np
 import pandas as pd
-
-from xgboost import XGBClassifier
-from sklearn.metrics import (
-    precision_score,
-    recall_score,
-    fbeta_score,
-)
+import xgboost as xgb
 
 
-START = time.time()
-
-print("=" * 75)
-print("STEP 4.4 - XGBOOST")
-print("=" * 75)
-
-
-# ================================================================
-# FILES
-# ================================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
 TRAIN_FILE = "step4_3_train_features.csv"
 VALID_FILE = "step4_3_valid_features.csv"
+VALID_PAIRS_FILE = "step4_valid_pairs.csv"
 
-# The feature CSV does not contain source1_entity_id.
-# We recover it from the original validation pair file.
-POSSIBLE_VALID_PAIR_FILES = [
-    "step4_1_valid_pairs.csv",
-    "step4_valid_pairs.csv",
-    "valid_pairs.csv",
-]
+MODEL_FILE = "step4_4_xgboost_model.json"
+THRESHOLD_FILE = "step4_4_best_threshold.json"
+
+VALID_PRED_FILE = "step4_4_valid_predictions.csv"
+THRESHOLD_RESULTS_FILE = "step4_4_threshold_results.csv"
 
 
-# ================================================================
-# FIND VALIDATION PAIR FILE
-# ================================================================
+# ============================================================
+# F0.5
+# ============================================================
 
-print("\nLocating validation pair file...")
+def f05(precision, recall):
+    beta2 = 0.25
 
-valid_pair_file = None
+    if precision + recall == 0:
+        return 0.0
 
-for filename in POSSIBLE_VALID_PAIR_FILES:
-    if Path(filename).exists():
-        valid_pair_file = filename
-        break
-
-# If none of the expected names exist, search automatically.
-if valid_pair_file is None:
-    candidates = sorted(Path(".").glob("*valid*pairs*.csv"))
-
-    if candidates:
-        valid_pair_file = str(candidates[0])
-
-if valid_pair_file is None:
-    raise FileNotFoundError(
-        "Could not find validation pair CSV.\n"
-        "Expected something like:\n"
-        "  step4_1_valid_pairs.csv\n"
-        "Run: dir *valid*pairs*.csv"
+    return (
+        (1 + beta2)
+        * precision
+        * recall
+        / (beta2 * precision + recall)
     )
 
-print(f"Validation pair file: {valid_pair_file}")
+
+def calculate_pr(y_true, y_pred):
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    tp = np.sum((y_true == 1) & (y_pred == 1))
+    fp = np.sum((y_true == 0) & (y_pred == 1))
+    fn = np.sum((y_true == 1) & (y_pred == 0))
+
+    precision = (
+        tp / (tp + fp)
+        if (tp + fp) > 0
+        else 0.0
+    )
+
+    recall = (
+        tp / (tp + fn)
+        if (tp + fn) > 0
+        else 0.0
+    )
+
+    score = f05(
+        precision,
+        recall
+    )
+
+    return precision, recall, score
 
 
-# ================================================================
+# ============================================================
+# ENTITY MACRO F0.5
+# ============================================================
+
+def entity_macro_f05(pair_df, threshold):
+
+    scores = []
+
+    for entity_id, group in pair_df.groupby(
+        "source1_entity_id"
+    ):
+
+        y_true = group["label"].to_numpy()
+
+        y_pred = (
+            group["prediction_probability"].to_numpy()
+            >= threshold
+        ).astype(int)
+
+        precision, recall, score = calculate_pr(
+            y_true,
+            y_pred
+        )
+
+        scores.append(score)
+
+    if not scores:
+        return 0.0
+
+    return float(np.mean(scores))
+
+
+# ============================================================
+# START
+# ============================================================
+
+print("=" * 70)
+print("STEP 4.4 - XGBOOST - SAVE FINAL MODEL")
+print("=" * 70)
+
+
+# ============================================================
 # LOAD FEATURES
-# ================================================================
+# ============================================================
 
 print("\nLoading feature matrices...")
 
 train_df = pd.read_csv(TRAIN_FILE)
 valid_df = pd.read_csv(VALID_FILE)
 
-print(f"Train: {train_df.shape}")
-print(f"Valid: {valid_df.shape}")
+print("Train:", train_df.shape)
+print("Valid:", valid_df.shape)
 
 
-# ================================================================
-# LOAD ORIGINAL VALIDATION PAIRS
-# ================================================================
-
-print("\nLoading validation pair metadata...")
-
-valid_pairs = pd.read_csv(valid_pair_file)
-
-print(f"Validation pairs: {valid_pairs.shape}")
-
-if len(valid_pairs) != len(valid_df):
-    raise ValueError(
-        f"\nValidation row mismatch!\n"
-        f"Feature rows: {len(valid_df):,}\n"
-        f"Pair rows:    {len(valid_pairs):,}\n"
-        f"\nThe feature CSV and pair CSV must have exactly "
-        f"the same row order and row count."
-    )
-
-if "source1_entity_id" not in valid_pairs.columns:
-    raise KeyError(
-        "The validation pair file does not contain "
-        "'source1_entity_id'.\n"
-        f"Columns found: {list(valid_pairs.columns)}"
-    )
-
-
-# ================================================================
+# ============================================================
 # FEATURES
-# ================================================================
+# ============================================================
 
-TARGET = "label"
-
-DROP_COLS = {
-    TARGET,
-    "source1_entity_id",
-    "candidate_entity_id",
-    "candidate_source",
-    "candidate_index",
-}
-
-FEATURES = [
-    c for c in train_df.columns
-    if c not in DROP_COLS
+feature_columns = [
+    c
+    for c in train_df.columns
+    if c != "label"
 ]
 
-print(f"\nFeatures: {len(FEATURES)}")
+print("\nFeatures:", len(feature_columns))
 
-for feature in FEATURES:
-    print(f"  {feature}")
-
-
-# ================================================================
-# PREPARE MATRICES
-# ================================================================
-
-X_train = train_df[FEATURES].astype(np.float32)
-y_train = train_df[TARGET].astype(np.int8)
-
-X_valid = valid_df[FEATURES].astype(np.float32)
-y_valid = valid_df[TARGET].astype(np.int8)
+for c in feature_columns:
+    print(" ", c)
 
 
-# ================================================================
+X_train = train_df[feature_columns]
+y_train = train_df["label"].astype(int)
+
+X_valid = valid_df[feature_columns]
+y_valid = valid_df["label"].astype(int)
+
+
+# ============================================================
 # CLASS DISTRIBUTION
-# ================================================================
+# ============================================================
 
-print("\nClass distribution:")
-
-train_positive = int(y_train.sum())
+train_positive = int((y_train == 1).sum())
 train_negative = int((y_train == 0).sum())
 
-valid_positive = int(y_valid.sum())
+valid_positive = int((y_valid == 1).sum())
 valid_negative = int((y_valid == 0).sum())
 
-print(f"Train positives: {train_positive:,}")
-print(f"Train negatives: {train_negative:,}")
-print(f"Valid positives: {valid_positive:,}")
-print(f"Valid negatives: {valid_negative:,}")
+scale_pos_weight = (
+    train_negative / train_positive
+)
 
-scale_pos_weight = train_negative / train_positive
+print("\nClass distribution:")
+print("Train positives:", f"{train_positive:,}")
+print("Train negatives:", f"{train_negative:,}")
+print("Valid positives:", f"{valid_positive:,}")
+print("Valid negatives:", f"{valid_negative:,}")
+print(
+    "scale_pos_weight:",
+    f"{scale_pos_weight:.4f}"
+)
 
-print(f"scale_pos_weight: {scale_pos_weight:.4f}")
 
-
-# ================================================================
-# TRAIN XGBOOST
-# ================================================================
+# ============================================================
+# MODEL
+# ============================================================
 
 print("\nTraining XGBoost...")
 
-model = XGBClassifier(
+model = xgb.XGBClassifier(
+
     n_estimators=500,
+
     max_depth=6,
+
     learning_rate=0.05,
+
     subsample=0.85,
+
     colsample_bytree=0.85,
+
     min_child_weight=3,
-    gamma=0.0,
+
+    gamma=0,
+
     reg_alpha=0.05,
-    reg_lambda=2.0,
+
+    reg_lambda=2,
 
     objective="binary:logistic",
+
     eval_metric="logloss",
 
-    # Try GPU first.
-    # XGBoost will fall back to CPU if unavailable.
     tree_method="hist",
+
     device="cuda",
 
     random_state=42,
+
     n_jobs=8,
 
     scale_pos_weight=scale_pos_weight,
@@ -197,28 +212,33 @@ model = XGBClassifier(
 
 
 try:
+
     model.fit(
         X_train,
         y_train,
-        eval_set=[(X_valid, y_valid)],
+        eval_set=[
+            (X_valid, y_valid)
+        ],
         verbose=False,
     )
 
-except Exception as e:
+except Exception:
 
-    print("\nCUDA training failed.")
-    print("Falling back to CPU...")
-    print(f"Reason: {e}")
+    print(
+        "\nGPU unavailable. "
+        "Training with CPU..."
+    )
 
     model.set_params(
-        device="cpu",
-        tree_method="hist",
+        device="cpu"
     )
 
     model.fit(
         X_train,
         y_train,
-        eval_set=[(X_valid, y_valid)],
+        eval_set=[
+            (X_valid, y_valid)
+        ],
         verbose=False,
     )
 
@@ -226,285 +246,292 @@ except Exception as e:
 print("Model trained.")
 
 
-# ================================================================
-# PREDICT
-# ================================================================
+# ============================================================
+# SAVE MODEL IMMEDIATELY
+# ============================================================
 
-print("\nPredicting validation...")
+print("\nSaving XGBoost model...")
 
-probs = model.predict_proba(X_valid)[:, 1]
-
-
-# ================================================================
-# THRESHOLD SEARCH
-# ================================================================
-
-print("\nSearching F0.5 threshold...")
-
-best_threshold = None
-best_pair_f05 = -1.0
-best_precision = 0.0
-best_recall = 0.0
-
-threshold_results = []
-
-for threshold in np.arange(0.50, 0.991, 0.01):
-
-    pred = (
-        probs >= threshold
-    ).astype(np.int8)
-
-    precision = precision_score(
-        y_valid,
-        pred,
-        zero_division=0,
-    )
-
-    recall = recall_score(
-        y_valid,
-        pred,
-        zero_division=0,
-    )
-
-    f05 = fbeta_score(
-        y_valid,
-        pred,
-        beta=0.5,
-        zero_division=0,
-    )
-
-    threshold_results.append(
-        (
-            float(threshold),
-            precision,
-            recall,
-            f05,
-        )
-    )
-
-    if f05 > best_pair_f05:
-
-        best_pair_f05 = f05
-        best_threshold = float(threshold)
-        best_precision = precision
-        best_recall = recall
-
-
-# ================================================================
-# PAIR RESULTS
-# ================================================================
-
-print("\n" + "=" * 75)
-print("STEP 4.4 RESULTS")
-print("=" * 75)
-
-print(f"Best threshold: {best_threshold:.2f}")
-print(f"Precision:       {best_precision:.6f}")
-print(f"Recall:          {best_recall:.6f}")
-print(f"Pair-level F0.5:  {best_pair_f05:.6f}")
-
-
-# ================================================================
-# ENTITY-LEVEL EVALUATION
-# ================================================================
-
-print("\nCalculating entity-level F0.5...")
-
-# IMPORTANT:
-# source1_entity_id is recovered from the original pair CSV.
-# The row order is preserved because the feature CSV was generated
-# directly from the pair CSV.
-
-valid_eval = pd.DataFrame(
-    {
-        "source1_entity_id":
-            valid_pairs["source1_entity_id"].values,
-
-        "label":
-            valid_df["label"].values,
-
-        "prob":
-            probs,
-    }
-)
-
-valid_eval["pred"] = (
-    valid_eval["prob"] >= best_threshold
-).astype(np.int8)
-
-
-# ================================================================
-# MACRO F0.5 PER SOURCE1 ENTITY
-# ================================================================
-
-entity_scores = []
-
-for entity_id, group in valid_eval.groupby(
-    "source1_entity_id",
-    sort=False,
-):
-
-    y_true = group["label"].to_numpy()
-
-    y_pred = group["pred"].to_numpy()
-
-    score = fbeta_score(
-        y_true,
-        y_pred,
-        beta=0.5,
-        zero_division=0,
-    )
-
-    entity_scores.append(score)
-
-
-entity_f05 = float(
-    np.mean(entity_scores)
+model.save_model(
+    MODEL_FILE
 )
 
 print(
-    f"Validation entities: "
-    f"{len(entity_scores):,}"
+    "Saved:",
+    MODEL_FILE
+)
+
+
+# ============================================================
+# VALIDATION PREDICTIONS
+# ============================================================
+
+print("\nPredicting validation...")
+
+valid_probability = model.predict_proba(
+    X_valid
+)[:, 1]
+
+
+# ============================================================
+# LOAD PAIR METADATA
+# ============================================================
+
+print("\nLoading validation pair metadata...")
+
+valid_pairs = pd.read_csv(
+    VALID_PAIRS_FILE
+)
+
+print(
+    "Validation pairs:",
+    valid_pairs.shape
+)
+
+
+# ============================================================
+# BUILD VALIDATION RESULT
+# ============================================================
+
+result_df = valid_pairs.copy()
+
+result_df["label"] = y_valid.to_numpy()
+
+result_df[
+    "prediction_probability"
+] = valid_probability
+
+
+# ============================================================
+# SEARCH THRESHOLD
+# ============================================================
+
+print("\nSearching F0.5 threshold...")
+
+threshold_rows = []
+
+for threshold in np.arange(
+    0.50,
+    0.951,
+    0.01
+):
+
+    predictions = (
+        valid_probability >= threshold
+    ).astype(int)
+
+    precision, recall, score = calculate_pr(
+        y_valid,
+        predictions
+    )
+
+    entity_score = entity_macro_f05(
+        result_df,
+        threshold
+    )
+
+    threshold_rows.append({
+        "threshold": round(
+            float(threshold),
+            2
+        ),
+        "precision": precision,
+        "recall": recall,
+        "pair_f05": score,
+        "entity_macro_f05": entity_score,
+    })
+
+
+threshold_df = pd.DataFrame(
+    threshold_rows
+)
+
+
+# ============================================================
+# BEST ENTITY-LEVEL THRESHOLD
+# ============================================================
+
+best_row = threshold_df.loc[
+    threshold_df["entity_macro_f05"].idxmax()
+]
+
+best_threshold = float(
+    best_row["threshold"]
+)
+
+best_precision = float(
+    best_row["precision"]
+)
+
+best_recall = float(
+    best_row["recall"]
+)
+
+best_pair_f05 = float(
+    best_row["pair_f05"]
+)
+
+best_entity_f05 = float(
+    best_row["entity_macro_f05"]
+)
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+print("\n" + "=" * 70)
+print("STEP 4.4 RESULTS")
+print("=" * 70)
+
+print(
+    f"Best threshold: {best_threshold:.2f}"
+)
+
+print(
+    f"Precision:       {best_precision:.6f}"
+)
+
+print(
+    f"Recall:          {best_recall:.6f}"
+)
+
+print(
+    f"Pair-level F0.5:  {best_pair_f05:.6f}"
 )
 
 print(
     f"Entity-level macro F0.5: "
-    f"{entity_f05:.6f}"
+    f"{best_entity_f05:.6f}"
 )
 
 
-# ================================================================
-# COMPARISON
-# ================================================================
+# ============================================================
+# SAVE THRESHOLD
+# ============================================================
 
-BASELINE = 0.873406
+with open(
+    THRESHOLD_FILE,
+    "w",
+    encoding="utf-8"
+) as f:
 
-print("\n" + "=" * 75)
-print("COMPARISON")
-print("=" * 75)
-
-print(
-    f"Step 4.3 baseline: "
-    f"{BASELINE:.6f}"
-)
-
-print(
-    f"Step 4.4 XGBoost:  "
-    f"{entity_f05:.6f}"
-)
-
-print(
-    f"Difference:        "
-    f"{entity_f05 - BASELINE:+.6f}"
-)
-
-
-# ================================================================
-# TOP THRESHOLDS
-# ================================================================
-
-print("\nTop threshold results:")
-
-threshold_results.sort(
-    key=lambda x: x[3],
-    reverse=True,
-)
-
-for threshold, precision, recall, f05 in (
-    threshold_results[:10]
-):
-
-    print(
-        f"threshold={threshold:.2f} | "
-        f"precision={precision:.6f} | "
-        f"recall={recall:.6f} | "
-        f"F0.5={f05:.6f}"
+    json.dump(
+        {
+            "threshold": best_threshold,
+            "precision": best_precision,
+            "recall": best_recall,
+            "pair_f05": best_pair_f05,
+            "entity_macro_f05": best_entity_f05,
+            "feature_count": len(feature_columns),
+            "features": feature_columns,
+        },
+        f,
+        indent=2,
     )
 
-
-# ================================================================
-# FEATURE IMPORTANCE
-# ================================================================
-
-print("\n" + "=" * 75)
-print("FEATURE IMPORTANCE")
-print("=" * 75)
-
-importance = pd.Series(
-    model.feature_importances_,
-    index=FEATURES,
-).sort_values(
-    ascending=False
+print(
+    "\nSaved:",
+    THRESHOLD_FILE
 )
 
-for feature, value in importance.items():
 
-    print(
-        f"{feature:35s} "
-        f"{value:.6f}"
-    )
+# ============================================================
+# SAVE VALIDATION PREDICTIONS
+# ============================================================
 
-
-# ================================================================
-# SAVE PREDICTIONS
-# ================================================================
-
-print("\nSaving validation predictions...")
-
-valid_output = valid_df.copy()
-
-valid_output["xgb_probability"] = probs
-
-valid_output["xgb_prediction"] = (
-    probs >= best_threshold
-).astype(np.int8)
-
-OUTPUT_FILE = (
-    "step4_4_valid_predictions.csv"
-)
-
-valid_output.to_csv(
-    OUTPUT_FILE,
-    index=False,
-)
-
-print(f"Saved: {OUTPUT_FILE}")
+result_df[
+    "prediction"
+] = (
+    result_df[
+        "prediction_probability"
+    ] >= best_threshold
+).astype(int)
 
 
-# ================================================================
-# SAVE THRESHOLD RESULTS
-# ================================================================
-
-threshold_df = pd.DataFrame(
-    threshold_results,
-    columns=[
-        "threshold",
-        "precision",
-        "recall",
-        "f05",
-    ],
+result_df.to_csv(
+    VALID_PRED_FILE,
+    index=False
 )
 
 threshold_df.to_csv(
-    "step4_4_threshold_results.csv",
-    index=False,
+    THRESHOLD_RESULTS_FILE,
+    index=False
 )
 
 print(
-    "Saved: "
-    "step4_4_threshold_results.csv"
+    "Saved:",
+    VALID_PRED_FILE
 )
-
-
-# ================================================================
-# FINAL
-# ================================================================
 
 print(
-    f"\nTotal runtime: "
-    f"{time.time() - START:.2f}s"
+    "Saved:",
+    THRESHOLD_RESULTS_FILE
 )
 
-print("=" * 75)
-print("DONE")
-print("=" * 75)
+
+# ============================================================
+# FEATURE IMPORTANCE
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FEATURE IMPORTANCE")
+print("=" * 70)
+
+importance = model.feature_importances_
+
+importance_df = pd.DataFrame({
+    "feature": feature_columns,
+    "importance": importance,
+})
+
+importance_df = importance_df.sort_values(
+    "importance",
+    ascending=False
+)
+
+for row in importance_df.itertuples(
+    index=False
+):
+
+    print(
+        f"{row.feature:<35} "
+        f"{row.importance:.6f}"
+    )
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+print("\n" + "=" * 70)
+print("MODEL SAVED SUCCESSFULLY")
+print("=" * 70)
+
+print(
+    "Model:",
+    MODEL_FILE
+)
+
+print(
+    "Threshold:",
+    f"{best_threshold:.2f}"
+)
+
+print(
+    "Entity macro F0.5:",
+    f"{best_entity_f05:.6f}"
+)
+
+print(
+    "Features:",
+    len(feature_columns)
+)
+
+print("\nNext stage:")
+print("  TEST candidate generation")
+print("  TEST feature generation")
+print("  TEST prediction")
+print("  final submission files")
+
+print("=" * 70)
