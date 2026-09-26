@@ -1,216 +1,243 @@
+#!/usr/bin/env python3
+
+"""
+STEP 4 - TEST CANDIDATE GENERATION
+
+Generates final candidate pairs for Source 1 test entities against
+Source 2 and Source 3.
+
+Design goals:
+- Memory-safe: DuckDB memory capped at 5 GB
+- Batch processing of Source 1
+- Strong token blocking
+- Country-aware matching without hard-coding countries
+- Exact name/address candidates always retained
+- Top-K candidates per source
+- Output contains only final candidate pairs
+"""
+
 import os
 import time
 import duckdb
 
+
 # ============================================================
-# STEP 4.5 - TEST CANDIDATE GENERATION
-# Memory-safe, batched DuckDB token blocking
+# CONFIGURATION
 # ============================================================
 
 BASE = "."
 
-S1_CACHE = f"{BASE}/normalized_cache_test/source1_normalized.parquet"
-S2_CACHE = f"{BASE}/normalized_cache_test/source2_normalized.parquet"
-S3_CACHE = f"{BASE}/normalized_cache_test/source3_normalized.parquet"
+S1_CACHE = "./normalized_cache_test/source1_normalized.parquet"
+S2_CACHE = "./normalized_cache_test/source2_normalized.parquet"
+S3_CACHE = "./normalized_cache_test/source3_normalized.parquet"
 
-OUTPUT = f"{BASE}/step4_test_candidate_pairs.csv"
-DB_FILE = f"{BASE}/test_candidate_index.duckdb"
-TEMP_DIR = f"{BASE}/duckdb_test_tmp"
+OUTPUT = "./step4_test_candidate_pairs.csv"
 
-BATCH_SIZE = 10000
+DB_FILE = "./test_candidate_index.duckdb"
+TEMP_DIR = "./duckdb_test_tmp"
 
-# Maximum token frequency allowed in candidate index.
-# Very common tokens create enormous candidate sets.
-MAX_TOKEN_FREQ = 5000
+# Keep RAM comfortably below the 8 GB target.
+DUCKDB_MEMORY = "5GB"
+DUCKDB_THREADS = 2
 
-# Keep the strongest candidates from each source for each Source1 row.
+# Batch size for Source 1.
+BATCH_SIZE = 10_000
+
+# Ignore extremely common tokens.
+MAX_TOKEN_FREQ = 5_000
+
+# Maximum candidates retained from each source per Source 1 entity.
 TOP_K_PER_SOURCE = 40
 
 
-def main():
+# ============================================================
+# HELPERS
+# ============================================================
 
-    start = time.time()
+def log(message):
+    print(message, flush=True)
 
-    print("=" * 70)
-    print("STEP 4.5 - TEST CANDIDATE GENERATION")
-    print("=" * 70)
+
+def remove_old_output():
+    if os.path.exists(OUTPUT):
+        os.remove(OUTPUT)
+
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+
+    if os.path.exists(TEMP_DIR):
+        # DuckDB temporary files can safely be removed from a
+        # previous completed/interrupted run.
+        import shutil
+        shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
     os.makedirs(TEMP_DIR, exist_ok=True)
 
-    print("\nInput caches:")
-    print(S1_CACHE)
-    print(S2_CACHE)
-    print(S3_CACHE)
 
-    print("\nOpening DuckDB...")
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    start_time = time.time()
+
+    log("=" * 70)
+    log("STEP 4 - TEST CANDIDATE GENERATION")
+    log("=" * 70)
+
+    remove_old_output()
+
+    # --------------------------------------------------------
+    # CONNECT DUCKDB
+    # --------------------------------------------------------
+
+    log("\nOpening DuckDB...")
 
     con = duckdb.connect(DB_FILE)
 
-    # Keep RAM below EC2 limit.
-    con.execute("SET memory_limit='5GB'")
+    con.execute(f"SET memory_limit='{DUCKDB_MEMORY}'")
     con.execute(f"SET temp_directory='{TEMP_DIR}'")
-    con.execute("SET threads=2")
+    con.execute(f"SET threads={DUCKDB_THREADS}")
 
     # --------------------------------------------------------
-    # Load candidate sources
+    # CHECK INPUT FILES
     # --------------------------------------------------------
 
-    print("\nRegistering Source2 and Source3...")
+    required_files = [
+        S1_CACHE,
+        S2_CACHE,
+        S3_CACHE,
+    ]
+
+    for path in required_files:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Required file not found: {path}"
+            )
+
+    log("Input files found.")
+
+    # --------------------------------------------------------
+    # CREATE SOURCE VIEWS
+    # --------------------------------------------------------
+
+    log("\nCreating Parquet views...")
+
+    con.execute(f"""
+        CREATE OR REPLACE VIEW source1 AS
+        SELECT *
+        FROM read_parquet('{S1_CACHE}')
+    """)
 
     con.execute(f"""
         CREATE OR REPLACE VIEW source2 AS
-        SELECT
-            entity_id,
-            name_norm,
-            addr_norm,
-            country_norm
+        SELECT *
         FROM read_parquet('{S2_CACHE}')
     """)
 
     con.execute(f"""
         CREATE OR REPLACE VIEW source3 AS
-        SELECT
-            entity_id,
-            name_norm,
-            addr_norm,
-            country_norm
+        SELECT *
         FROM read_parquet('{S3_CACHE}')
     """)
 
     # --------------------------------------------------------
-    # Build token index
+    # COUNT SOURCE 1
     # --------------------------------------------------------
-
-    print("\nBuilding token index...")
-    print("This is disk-backed and may take some time.")
-
-    con.execute("DROP TABLE IF EXISTS token_index")
-
-    con.execute("""
-        CREATE TABLE token_index AS
-
-        SELECT DISTINCT
-            token,
-            candidate_entity_id,
-            candidate_source,
-            candidate_index,
-            country_norm
-
-        FROM (
-
-            SELECT
-                token,
-                entity_id AS candidate_entity_id,
-                'source2' AS candidate_source,
-                entity_id AS candidate_index,
-                country_norm
-
-            FROM source2,
-            LATERAL unnest(regexp_split_to_array(
-                lower(coalesce(name_norm, '') || ' ' ||
-                      coalesce(addr_norm, '')),
-                '\\s+'
-            )) AS t(token)
-
-            WHERE length(token) >= 2
-
-            UNION ALL
-
-            SELECT
-                token,
-                entity_id AS candidate_entity_id,
-                'source3' AS candidate_source,
-                entity_id AS candidate_index,
-                country_norm
-
-            FROM source3,
-            LATERAL unnest(regexp_split_to_array(
-                lower(coalesce(name_norm, '') || ' ' ||
-                      coalesce(addr_norm, '')),
-                '\\s+'
-            )) AS t(token)
-
-            WHERE length(token) >= 2
-        )
-    """)
-
-    print("Token index created.")
-
-    # --------------------------------------------------------
-    # Token frequencies
-    # --------------------------------------------------------
-
-    print("\nCalculating token frequencies...")
-
-    con.execute("DROP TABLE IF EXISTS token_frequency")
-
-    con.execute("""
-        CREATE TABLE token_frequency AS
-        SELECT
-            token,
-            COUNT(*) AS freq
-        FROM token_index
-        GROUP BY token
-    """)
-
-    con.execute("""
-        CREATE INDEX IF NOT EXISTS idx_token_frequency
-        ON token_frequency(token)
-    """)
-
-    con.execute("""
-        CREATE INDEX IF NOT EXISTS idx_token_index
-        ON token_index(token)
-    """)
-
-    freq_count = con.execute("""
-        SELECT COUNT(*)
-        FROM token_frequency
-        WHERE freq <= ?
-    """, [MAX_TOKEN_FREQ]).fetchone()[0]
-
-    print(
-        f"Usable tokens (frequency <= {MAX_TOKEN_FREQ:,}): "
-        f"{freq_count:,}"
-    )
-
-    # --------------------------------------------------------
-    # Source1
-    # --------------------------------------------------------
-
-    con.execute(f"""
-        CREATE OR REPLACE VIEW source1 AS
-        SELECT
-            row_number() OVER () AS s1_row_number,
-            entity_id,
-            name_norm,
-            addr_norm,
-            country_norm
-        FROM read_parquet('{S1_CACHE}')
-    """)
 
     total_s1 = con.execute("""
         SELECT COUNT(*)
         FROM source1
     """).fetchone()[0]
 
-    print(f"\nTest Source1 entities: {total_s1:,}")
-    print(f"Batch size: {BATCH_SIZE:,}")
-    print(f"Top candidates/source: {TOP_K_PER_SOURCE}")
+    log(f"Test Source1 entities: {total_s1:,}")
+    log(f"Batch size: {BATCH_SIZE:,}")
+    log(f"Expected batches: {(total_s1 + BATCH_SIZE - 1) // BATCH_SIZE:,}")
 
     # --------------------------------------------------------
-    # Output
+    # BUILD TOKEN INDEX
     # --------------------------------------------------------
 
-    if os.path.exists(OUTPUT):
-        print(f"\nRemoving existing output: {OUTPUT}")
-        os.remove(OUTPUT)
+    log("\nBuilding token index...")
 
-    first_batch = True
+    con.execute("""
+        CREATE TABLE token_index AS
+
+        SELECT DISTINCT
+            token,
+            entity_id AS candidate_entity_id,
+            'source2' AS candidate_source,
+            country_norm
+        FROM source2
+        CROSS JOIN UNNEST(name_tokens) AS t(token)
+
+        UNION
+
+        SELECT DISTINCT
+            token,
+            entity_id AS candidate_entity_id,
+            'source3' AS candidate_source,
+            country_norm
+        FROM source3
+        CROSS JOIN UNNEST(name_tokens) AS t(token)
+    """)
+
+    token_count = con.execute("""
+        SELECT COUNT(*)
+        FROM token_index
+    """).fetchone()[0]
+
+    log(f"Token index rows: {token_count:,}")
 
     # --------------------------------------------------------
-    # Batch loop
+    # TOKEN FREQUENCY
     # --------------------------------------------------------
+
+    log("Calculating token frequencies...")
+
+    con.execute("""
+        CREATE TABLE token_frequency AS
+        SELECT
+            token,
+            COUNT(*) AS frequency
+        FROM token_index
+        GROUP BY token
+    """)
+
+    usable_tokens = con.execute(f"""
+        SELECT COUNT(*)
+        FROM token_frequency
+        WHERE frequency <= {MAX_TOKEN_FREQ}
+    """).fetchone()[0]
+
+    log(
+        f"Usable tokens (frequency <= {MAX_TOKEN_FREQ:,}): "
+        f"{usable_tokens:,}"
+    )
+
+    # --------------------------------------------------------
+    # SOURCE 1 ROW NUMBERS
+    # --------------------------------------------------------
+
+    log("\nPreparing Source1 batches...")
+
+    con.execute("""
+        CREATE VIEW source1_numbered AS
+
+        SELECT
+            *,
+            ROW_NUMBER() OVER () AS s1_row_number
+
+        FROM source1
+    """)
+
+    # --------------------------------------------------------
+    # BATCH LOOP
+    # --------------------------------------------------------
+
+    total_candidate_rows = 0
+    total_batches = (total_s1 + BATCH_SIZE - 1) // BATCH_SIZE
 
     for batch_start in range(0, total_s1, BATCH_SIZE):
 
@@ -220,30 +247,32 @@ def main():
         )
 
         batch_no = batch_start // BATCH_SIZE + 1
-        total_batches = (total_s1 + BATCH_SIZE - 1) // BATCH_SIZE
 
-        print(
-            f"\nBatch {batch_no}/{total_batches} "
-            f"rows {batch_start:,} - {batch_end:,}"
+        batch_time = time.time()
+
+        log(
+            f"\nBatch {batch_no:,}/{total_batches:,} "
+            f"Source1 rows "
+            f"{batch_start + 1:,}-{batch_end:,}"
         )
+
+        # ----------------------------------------------------
+        # SOURCE 1 BATCH
+        # ----------------------------------------------------
 
         con.execute("DROP TABLE IF EXISTS s1_batch")
 
-        con.execute("""
+        con.execute(f"""
             CREATE TEMP TABLE s1_batch AS
-            SELECT
-                s1_row_number,
-                entity_id,
-                name_norm,
-                addr_norm,
-                country_norm
-            FROM source1
-            WHERE s1_row_number > ?
-              AND s1_row_number <= ?
-        """, [batch_start, batch_end])
+
+            SELECT *
+            FROM source1_numbered
+            WHERE s1_row_number > {batch_start}
+              AND s1_row_number <= {batch_end}
+        """)
 
         # ----------------------------------------------------
-        # Candidate scoring by shared tokens
+        # TOKEN CANDIDATES
         # ----------------------------------------------------
 
         con.execute("DROP TABLE IF EXISTS batch_candidates")
@@ -251,95 +280,72 @@ def main():
         con.execute(f"""
             CREATE TEMP TABLE batch_candidates AS
 
-            WITH s1_tokens AS (
-
-                SELECT DISTINCT
-                    s1_row_number,
-                    entity_id,
-                    country_norm,
-                    token
-
-                FROM s1_batch,
-
-                LATERAL unnest(regexp_split_to_array(
-                    lower(
-                        coalesce(name_norm, '') || ' ' ||
-                        coalesce(addr_norm, '')
-                    ),
-                    '\\s+'
-                )) AS t(token)
-
-                WHERE length(token) >= 2
-            ),
-
-            usable_tokens AS (
+            WITH shared_tokens AS (
 
                 SELECT
-                    s.token,
-                    s.s1_row_number,
-                    s.entity_id,
-                    s.country_norm
-
-                FROM s1_tokens s
-
-                INNER JOIN token_frequency f
-                    ON s.token = f.token
-
-                WHERE f.freq <= {MAX_TOKEN_FREQ}
-            ),
-
-            scored AS (
-
-                SELECT
-                    u.s1_row_number,
-                    u.entity_id AS source1_entity_id,
-
+                    s.entity_id AS source1_entity_id,
                     ti.candidate_entity_id,
                     ti.candidate_source,
-                    ti.candidate_index,
 
-                    COUNT(DISTINCT u.token) AS shared_token_count
+                    COUNT(DISTINCT t.token) AS shared_token_count,
 
-                FROM usable_tokens u
+                    CASE
+                        WHEN
+                            s.country_norm IS NULL
+                            OR ti.country_norm IS NULL
+                            OR s.country_norm = ''
+                            OR ti.country_norm = ''
+                            OR s.country_norm = ti.country_norm
+                        THEN 1
+                        ELSE 0
+                    END AS country_compatible
+
+                FROM s1_batch s
+
+                CROSS JOIN UNNEST(s.name_tokens) AS t(token)
+
+                INNER JOIN token_frequency tf
+                    ON tf.token = t.token
+                   AND tf.frequency <= {MAX_TOKEN_FREQ}
 
                 INNER JOIN token_index ti
-                    ON u.token = ti.token
-                   AND (
-                        u.country_norm = ti.country_norm
-                        OR u.country_norm IS NULL
-                        OR ti.country_norm IS NULL
-                   )
+                    ON ti.token = t.token
 
                 GROUP BY
-                    u.s1_row_number,
-                    u.entity_id,
+                    s.entity_id,
                     ti.candidate_entity_id,
                     ti.candidate_source,
-                    ti.candidate_index
+                    s.country_norm,
+                    ti.country_norm
             ),
 
             ranked AS (
 
                 SELECT
-                    *,
+                    source1_entity_id,
+                    candidate_entity_id,
+                    candidate_source,
+
                     ROW_NUMBER() OVER (
                         PARTITION BY
-                            s1_row_number,
+                            source1_entity_id,
                             candidate_source
 
                         ORDER BY
+                            country_compatible DESC,
                             shared_token_count DESC,
                             candidate_entity_id
                     ) AS rn
 
-                FROM scored
+                FROM shared_tokens
+
+                WHERE country_compatible = 1
             )
 
             SELECT
                 source1_entity_id,
                 candidate_entity_id,
-                candidate_source,
-                candidate_index
+                candidate_source
 
             FROM ranked
 
@@ -347,104 +353,100 @@ def main():
         """)
 
         # ----------------------------------------------------
-        # Add exact normalized name candidates.
-        # These are extremely valuable and should never be
-        # discarded by TOP_K.
+        # EXACT NAME CANDIDATES
         # ----------------------------------------------------
 
-        con.execute("DROP TABLE IF EXISTS exact_name_candidates")
+        con.execute("""
+            INSERT INTO batch_candidates
+
+            SELECT DISTINCT
+                s.entity_id AS source1_entity_id,
+                x.entity_id AS candidate_entity_id,
+                'source2' AS candidate_source
+
+            FROM s1_batch s
+            INNER JOIN source2 x
+                ON s.name_norm <> ''
+               AND s.name_norm = x.name_norm
+
+            WHERE
+                s.country_norm IS NULL
+                OR x.country_norm IS NULL
+                OR s.country_norm = ''
+                OR x.country_norm = ''
+                OR s.country_norm = x.country_norm
+        """)
 
         con.execute("""
-            CREATE TEMP TABLE exact_name_candidates AS
+            INSERT INTO batch_candidates
 
             SELECT DISTINCT
-                b.entity_id AS source1_entity_id,
-                s.entity_id AS candidate_entity_id,
-                'source2' AS candidate_source,
-                s.entity_id AS candidate_index
+                s.entity_id AS source1_entity_id,
+                x.entity_id AS candidate_entity_id,
+                'source3' AS candidate_source
 
-            FROM s1_batch b
+            FROM s1_batch s
+            INNER JOIN source3 x
+                ON s.name_norm <> ''
+               AND s.name_norm = x.name_norm
 
-            INNER JOIN source2 s
-                ON b.name_norm <> ''
-               AND b.name_norm = s.name_norm
-               AND (
-                    b.country_norm = s.country_norm
-                    OR b.country_norm IS NULL
-                    OR s.country_norm IS NULL
-               )
-
-            UNION
-
-            SELECT DISTINCT
-                b.entity_id AS source1_entity_id,
-                s.entity_id AS candidate_entity_id,
-                'source3' AS candidate_source,
-                s.entity_id AS candidate_index
-
-            FROM s1_batch b
-
-            INNER JOIN source3 s
-                ON b.name_norm <> ''
-               AND b.name_norm = s.name_norm
-               AND (
-                    b.country_norm = s.country_norm
-                    OR b.country_norm IS NULL
-                    OR s.country_norm IS NULL
-               )
+            WHERE
+                s.country_norm IS NULL
+                OR x.country_norm IS NULL
+                OR s.country_norm = ''
+                OR x.country_norm = ''
+                OR s.country_norm = x.country_norm
         """)
 
         # ----------------------------------------------------
-        # Add exact normalized address candidates.
+        # EXACT ADDRESS CANDIDATES
         # ----------------------------------------------------
 
-        con.execute("DROP TABLE IF EXISTS exact_addr_candidates")
+        con.execute("""
+            INSERT INTO batch_candidates
+
+            SELECT DISTINCT
+                s.entity_id AS source1_entity_id,
+                x.entity_id AS candidate_entity_id,
+                'source2' AS candidate_source
+
+            FROM s1_batch s
+            INNER JOIN source2 x
+                ON s.address_norm <> ''
+               AND s.address_norm = x.address_norm
+
+            WHERE
+                s.country_norm IS NULL
+                OR x.country_norm IS NULL
+                OR s.country_norm = ''
+                OR x.country_norm = ''
+                OR s.country_norm = x.country_norm
+        """)
 
         con.execute("""
-            CREATE TEMP TABLE exact_addr_candidates AS
+            INSERT INTO batch_candidates
 
             SELECT DISTINCT
-                b.entity_id AS source1_entity_id,
-                s.entity_id AS candidate_entity_id,
-                'source2' AS candidate_source,
-                s.entity_id AS candidate_index
+                s.entity_id AS source1_entity_id,
+                x.entity_id AS candidate_entity_id,
+                'source3' AS candidate_source
 
-            FROM s1_batch b
+            FROM s1_batch s
+            INNER JOIN source3 x
+                ON s.address_norm <> ''
+               AND s.address_norm = x.address_norm
 
-            INNER JOIN source2 s
-                ON b.addr_norm <> ''
-               AND b.addr_norm = s.addr_norm
-               AND (
-                    b.country_norm = s.country_norm
-                    OR b.country_norm IS NULL
-                    OR s.country_norm IS NULL
-               )
-
-            UNION
-
-            SELECT DISTINCT
-                b.entity_id AS source1_entity_id,
-                s.entity_id AS candidate_entity_id,
-                'source3' AS candidate_source,
-                s.entity_id AS candidate_index
-
-            FROM s1_batch b
-
-            INNER JOIN source3 s
-                ON b.addr_norm <> ''
-               AND b.addr_norm = s.addr_norm
-               AND (
-                    b.country_norm = s.country_norm
-                    OR b.country_norm IS NULL
-                    OR s.country_norm IS NULL
-               )
+            WHERE
+                s.country_norm IS NULL
+                OR x.country_norm IS NULL
+                OR s.country_norm = ''
+                OR x.country_norm = ''
+                OR s.country_norm = x.country_norm
         """)
 
         # ----------------------------------------------------
-        # Combine candidates and remove duplicates.
+        # REMOVE DUPLICATES
         # ----------------------------------------------------
-
-        con.execute("DROP TABLE IF EXISTS batch_output")
 
         con.execute("""
             CREATE TEMP TABLE batch_output AS
@@ -452,115 +454,128 @@ def main():
             SELECT DISTINCT
                 source1_entity_id,
                 candidate_entity_id,
-                candidate_source,
-                candidate_index
+                candidate_source
 
-            FROM (
-
-                SELECT *
-                FROM batch_candidates
-
-                UNION ALL
-
-                SELECT *
-                FROM exact_name_candidates
-
-                UNION ALL
-
-                SELECT *
-                FROM exact_addr_candidates
-            )
+            FROM batch_candidates
         """)
 
-        batch_count = con.execute("""
+        batch_rows = con.execute("""
             SELECT COUNT(*)
             FROM batch_output
         """).fetchone()[0]
 
-        print(f"Candidates in batch: {batch_count:,}")
+        total_candidate_rows += batch_rows
 
         # ----------------------------------------------------
-        # Append to CSV
+        # WRITE OUTPUT
         # ----------------------------------------------------
 
-        if first_batch:
+        if batch_no == 1:
 
             con.execute(f"""
-                COPY (
-                    SELECT
-                        source1_entity_id,
-                        candidate_entity_id,
-                        candidate_source,
-                        candidate_index
-
-                    FROM batch_output
-
-                    ORDER BY
-                        source1_entity_id,
-                        candidate_source,
-                        candidate_entity_id
-                )
-
+                COPY batch_output
                 TO '{OUTPUT}'
                 (
-                    FORMAT CSV,
-                    HEADER TRUE
+                    HEADER TRUE,
+                    DELIMITER ','
                 )
             """)
-
-            first_batch = False
 
         else:
 
             con.execute(f"""
-                COPY (
-                    SELECT
-                        source1_entity_id,
-                        candidate_entity_id,
-                        candidate_source,
-                        candidate_index
-
-                    FROM batch_output
-
-                    ORDER BY
-                        source1_entity_id,
-                        candidate_source,
-                        candidate_entity_id
-                )
-
+                COPY batch_output
                 TO '{OUTPUT}'
                 (
-                    FORMAT CSV,
                     HEADER FALSE,
+                    DELIMITER ',',
                     APPEND TRUE
                 )
             """)
 
-        elapsed = time.time() - start
+        elapsed = time.time() - batch_time
 
-        print(
-            f"Elapsed: {elapsed / 60:.1f} min"
+        log(
+            f"  Candidate rows: {batch_rows:,}"
+        )
+
+        log(
+            f"  Total candidate rows: "
+            f"{total_candidate_rows:,}"
+        )
+
+        log(
+            f"  Batch time: {elapsed:.1f}s"
         )
 
     # --------------------------------------------------------
-    # Final statistics
+    # FINAL STATISTICS
     # --------------------------------------------------------
 
-    print("\n" + "=" * 70)
-    print("CANDIDATE GENERATION COMPLETE")
-    print("=" * 70)
+    log("\n" + "=" * 70)
+    log("CANDIDATE GENERATION COMPLETE")
+    log("=" * 70)
 
-    print(f"Output: {OUTPUT}")
+    output_rows = con.execute(f"""
+        SELECT COUNT(*)
+        FROM read_csv(
+            '{OUTPUT}',
+            header=true,
+            delim=','
+        )
+    """).fetchone()[0]
 
-    if os.path.exists(OUTPUT):
-        size_mb = os.path.getsize(OUTPUT) / (1024 * 1024)
-        print(f"Output size: {size_mb:.1f} MB")
+    unique_s1 = con.execute(f"""
+        SELECT COUNT(DISTINCT source1_entity_id)
+        FROM read_csv(
+            '{OUTPUT}',
+            header=true,
+            delim=','
+        )
+    """).fetchone()[0]
+
+    source2_candidates = con.execute(f"""
+        SELECT COUNT(*)
+        FROM read_csv(
+            '{OUTPUT}',
+            header=true,
+            delim=','
+        )
+        WHERE candidate_source = 'source2'
+    """).fetchone()[0]
+
+    source3_candidates = con.execute(f"""
+        SELECT COUNT(*)
+        FROM read_csv(
+            '{OUTPUT}',
+            header=true,
+            delim=','
+        )
+        WHERE candidate_source = 'source3'
+    """).fetchone()[0]
+
+    log(f"Source1 entities:       {total_s1:,}")
+    log(f"Source1 with candidates:{unique_s1:,}")
+    log(f"Candidate rows:         {output_rows:,}")
+    log(f"Source2 candidates:     {source2_candidates:,}")
+    log(f"Source3 candidates:     {source3_candidates:,}")
+
+    coverage = (
+        unique_s1 / total_s1 * 100
+        if total_s1
+        else 0
+    )
+
+    log(f"Source1 candidate coverage: {coverage:.2f}%")
+
+    total_time = time.time() - start_time
+
+    log(f"Total time: {total_time / 60:.2f} minutes")
+    log(f"Output: {OUTPUT}")
 
     con.close()
 
-    print(
-        f"Total runtime: {(time.time() - start) / 60:.1f} minutes"
-    )
+    log("\nDone.")
 
 
 if __name__ == "__main__":
