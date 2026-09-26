@@ -128,7 +128,7 @@ def main():
                 lower(coalesce(name_norm, '') || ' ' ||
                       coalesce(addr_norm, '')),
                 '\\s+'
-            ) AS t(token)
+            )) AS t(token)
 
             WHERE length(token) >= 2
         )
@@ -267,7 +267,7 @@ def main():
                         coalesce(addr_norm, '')
                     ),
                     '\\s+'
-                ) AS t(token)
+                )) AS t(token)
 
                 WHERE length(token) >= 2
             ),
