@@ -1,9 +1,11 @@
 import os
 import re
 import difflib
-import pandas as pd
-import numpy as np
 from collections import Counter
+
+import duckdb
+import numpy as np
+import pandas as pd
 
 
 # ============================================================
@@ -24,7 +26,7 @@ S3_PATH = os.path.join(CACHE, "source3_normalized.parquet")
 
 
 # ============================================================
-# BASIC HELPERS
+# TEXT HELPERS
 # ============================================================
 
 def safe_text(x):
@@ -161,11 +163,11 @@ def digit_similarity(a, b):
 
 def build_weights(records):
     """
-    Build token weights only from the records actually needed
-    for the current feature-generation run.
+    Build lightweight IDF-style weights only from records
+    participating in the pair files.
 
-    This avoids materializing all tokens from all 12M+ records
-    inside DuckDB.
+    This deliberately avoids scanning/holding all 12M+
+    source records in Python.
     """
 
     counter = Counter()
@@ -221,12 +223,17 @@ def weighted_overlap(a, b, weights):
 
 
 # ============================================================
-# LOAD NORMALIZED RECORDS
+# START
 # ============================================================
 
 print("=" * 70)
-print("STEP 4.3 - 21 FEATURE GENERATION")
+print("STEP 4.3 - MEMORY-SAFE 21 FEATURE GENERATION")
 print("=" * 70)
+
+
+# ============================================================
+# LOAD PAIRS
+# ============================================================
 
 print("\nLoading pair files...")
 
@@ -236,125 +243,199 @@ valid_pairs = pd.read_csv(VALID_PAIRS)
 print("Train pairs:", train_pairs.shape)
 print("Valid pairs:", valid_pairs.shape)
 
-
-# ============================================================
-# LOAD NORMALIZED PARQUET FILES
-# ============================================================
-
-print("\nLoading normalized source files...")
-
-s1 = pd.read_parquet(S1_PATH)
-s2 = pd.read_parquet(S2_PATH)
-s3 = pd.read_parquet(S3_PATH)
-
-print("Source1:", s1.shape)
-print("Source2:", s2.shape)
-print("Source3:", s3.shape)
-
-
-# ============================================================
-# CREATE CANDIDATE INDEX
-# ============================================================
-
-print("\nCreating candidate indexes...")
-
-s2 = s2.reset_index(drop=True)
-s3 = s3.reset_index(drop=True)
-
-s2["candidate_index"] = np.arange(len(s2), dtype=np.int64)
-s3["candidate_index"] = np.arange(len(s3), dtype=np.int64)
-
-
-# ============================================================
-# LOOKUP DICTIONARIES
-# ============================================================
-
-print("\nBuilding lookup dictionaries...")
-
-s1_lookup = {}
-
-for row in s1.itertuples(index=False):
-    s1_lookup[row.entity_id] = row
-
-
-s2_lookup = {}
-
-for row in s2.itertuples(index=False):
-    s2_lookup[row.candidate_index] = row
-
-
-s3_lookup = {}
-
-for row in s3.itertuples(index=False):
-    s3_lookup[row.candidate_index] = row
-
-
-print("S1 lookup:", f"{len(s1_lookup):,}")
-print("S2 lookup:", f"{len(s2_lookup):,}")
-print("S3 lookup:", f"{len(s3_lookup):,}")
-
-
-# ============================================================
-# IMPORTANT:
-# ONLY BUILD TOKEN WEIGHTS FROM PAIRS
-# ============================================================
-
-print("\nBuilding lightweight token weights...")
-
-needed_s1_ids = set(train_pairs["source1_entity_id"])
-needed_s1_ids.update(valid_pairs["source1_entity_id"])
-
-needed_s1_records = []
-
-for entity_id in needed_s1_ids:
-    row = s1_lookup.get(entity_id)
-
-    if row is not None:
-        needed_s1_records.append(
-            safe_text(row.name_norm)
-        )
-        needed_s1_records.append(
-            safe_text(row.addr_norm)
-        )
-
-
-needed_candidate_records = []
-
 all_pairs = pd.concat(
     [train_pairs, valid_pairs],
     ignore_index=True
 )
 
-for row in all_pairs.itertuples(index=False):
-
-    candidate_index = int(row.candidate_index)
-
-    if int(row.candidate_source) == 0:
-        cand = s2_lookup.get(candidate_index)
-    else:
-        cand = s3_lookup.get(candidate_index)
-
-    if cand is not None:
-        needed_candidate_records.append(
-            safe_text(cand.name_norm)
-        )
-        needed_candidate_records.append(
-            safe_text(cand.addr_norm)
-        )
-
-
-weights = build_weights(
-    needed_s1_records + needed_candidate_records
+all_pairs["_pair_id"] = np.arange(
+    len(all_pairs),
+    dtype=np.int64
 )
+
+
+# ============================================================
+# DUCKDB
+# ============================================================
+
+print("\nStarting DuckDB...")
+
+con = duckdb.connect()
+
+con.execute("PRAGMA threads=2")
+con.execute("PRAGMA memory_limit='5GB'")
+con.execute("PRAGMA preserve_insertion_order=false")
+
+
+# ============================================================
+# REGISTER ONLY THE 57K PAIRS
+# ============================================================
+
+print("\nRegistering pair table...")
+
+con.register(
+    "pairs",
+    all_pairs[
+        [
+            "_pair_id",
+            "source1_entity_id",
+            "candidate_entity_id",
+            "candidate_source",
+            "candidate_index",
+        ]
+    ]
+)
+
+
+# ============================================================
+# FETCH ONLY REQUIRED RECORDS
+# ============================================================
+
+print("\nFetching only records required by pairs...")
+print("No full-source Python dictionaries will be created.")
+
+
+query = f"""
+WITH pair_records AS (
+
+    SELECT
+        p._pair_id,
+        p.source1_entity_id,
+        p.candidate_entity_id,
+        p.candidate_source,
+        p.candidate_index,
+
+        s1.name_norm AS s1_name,
+        s1.addr_norm AS s1_addr,
+        s1.country_norm AS s1_country
+
+    FROM pairs p
+
+    INNER JOIN read_parquet('{S1_PATH}') s1
+        ON s1.entity_id = p.source1_entity_id
+),
+
+candidate_records AS (
+
+    SELECT
+        p._pair_id,
+        s2.name_norm AS candidate_name,
+        s2.addr_norm AS candidate_addr,
+        s2.country_norm AS candidate_country
+
+    FROM pairs p
+
+    INNER JOIN read_parquet('{S2_PATH}') s2
+        ON s2.entity_id = p.candidate_entity_id
+
+    WHERE p.candidate_source = 0
+
+    UNION ALL
+
+    SELECT
+        p._pair_id,
+        s3.name_norm AS candidate_name,
+        s3.addr_norm AS candidate_addr,
+        s3.country_norm AS candidate_country
+
+    FROM pairs p
+
+    INNER JOIN read_parquet('{S3_PATH}') s3
+        ON s3.entity_id = p.candidate_entity_id
+
+    WHERE p.candidate_source = 1
+)
+
+SELECT
+    p._pair_id,
+    p.source1_entity_id,
+    p.candidate_entity_id,
+    p.candidate_source,
+    p.candidate_index,
+
+    p.s1_name,
+    p.s1_addr,
+    p.s1_country,
+
+    c.candidate_name,
+    c.candidate_addr,
+    c.candidate_country
+
+FROM pair_records p
+
+INNER JOIN candidate_records c
+    ON c._pair_id = p._pair_id
+
+ORDER BY p._pair_id
+"""
+
+
+pair_data = con.execute(query).fetchdf()
+
+print(
+    "Joined pair records:",
+    pair_data.shape
+)
+
+
+# ============================================================
+# CHECK
+# ============================================================
+
+if len(pair_data) != len(all_pairs):
+    print(
+        "\nWARNING:"
+        f" expected {len(all_pairs):,} rows,"
+        f" got {len(pair_data):,} rows."
+    )
+
+    missing = len(all_pairs) - len(pair_data)
+
+    if missing > 0:
+        raise RuntimeError(
+            f"{missing:,} pair records could not be joined."
+        )
+
+
+# ============================================================
+# BUILD LIGHTWEIGHT TOKEN WEIGHTS
+# ============================================================
+
+print("\nBuilding lightweight token weights...")
+
+weight_records = []
+
+for row in pair_data.itertuples(index=False):
+
+    weight_records.append(
+        safe_text(row.s1_name)
+    )
+
+    weight_records.append(
+        safe_text(row.s1_addr)
+    )
+
+    weight_records.append(
+        safe_text(row.candidate_name)
+    )
+
+    weight_records.append(
+        safe_text(row.candidate_addr)
+    )
+
+
+weights = build_weights(weight_records)
 
 print(
     "Weighted vocabulary:",
     f"{len(weights):,}"
 )
 
+del weight_records
+
 
 # ============================================================
-# FEATURE GENERATION
+# FEATURE COLUMNS
 # ============================================================
 
 FEATURE_COLUMNS = [
@@ -387,56 +468,36 @@ FEATURE_COLUMNS = [
 ]
 
 
-def generate_features(pairs, split_name):
+# ============================================================
+# CALCULATE FEATURES
+# ============================================================
 
-    print("\n" + "-" * 70)
-    print("Generating", split_name, "features")
-    print("-" * 70)
+def calculate_features(df):
 
-    output = []
+    rows = []
 
-    total = len(pairs)
+    total = len(df)
+
+    print(
+        f"\nCalculating {len(FEATURE_COLUMNS)} features "
+        f"for {total:,} pairs..."
+    )
 
     for i, row in enumerate(
-        pairs.itertuples(index=False),
+        df.itertuples(index=False),
         start=1
     ):
 
-        s1_id = row.source1_entity_id
+        s1_name = safe_text(row.s1_name)
+        s1_addr = safe_text(row.s1_addr)
 
-        candidate_index = int(row.candidate_index)
-        candidate_source = int(row.candidate_source)
+        candidate_name = safe_text(
+            row.candidate_name
+        )
 
-        s1_row = s1_lookup.get(s1_id)
-
-        if s1_row is None:
-            raise RuntimeError(
-                f"Source1 ID not found: {s1_id}"
-            )
-
-        if candidate_source == 0:
-            candidate_row = s2_lookup.get(
-                candidate_index
-            )
-        else:
-            candidate_row = s3_lookup.get(
-                candidate_index
-            )
-
-        if candidate_row is None:
-            raise RuntimeError(
-                f"Candidate not found: "
-                f"source={candidate_source}, "
-                f"index={candidate_index}"
-            )
-
-        s1_name = safe_text(s1_row.name_norm)
-        s1_addr = safe_text(s1_row.addr_norm)
-        s1_country = safe_text(s1_row.country_norm)
-
-        c_name = safe_text(candidate_row.name_norm)
-        c_addr = safe_text(candidate_row.addr_norm)
-        c_country = safe_text(candidate_row.country_norm)
+        candidate_addr = safe_text(
+            row.candidate_addr
+        )
 
         features = [
 
@@ -444,52 +505,56 @@ def generate_features(pairs, split_name):
             # NAME
             # ------------------------------------------------
 
-            float(s1_name == c_name),
+            float(
+                s1_name == candidate_name
+            ),
 
             char_sim(
                 s1_name,
-                c_name
+                candidate_name
             ),
 
             token_jaccard(
                 s1_name,
-                c_name
+                candidate_name
             ),
 
             token_overlap(
                 s1_name,
-                c_name
+                candidate_name
             ),
 
             length_ratio(
                 s1_name,
-                c_name
+                candidate_name
             ),
 
             # ------------------------------------------------
             # ADDRESS
             # ------------------------------------------------
 
-            float(s1_addr == c_addr),
+            float(
+                s1_addr == candidate_addr
+            ),
 
             char_sim(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             token_jaccard(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             token_overlap(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             length_ratio(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             # ------------------------------------------------
@@ -498,22 +563,22 @@ def generate_features(pairs, split_name):
 
             prefix4(
                 s1_name,
-                c_name
+                candidate_name
             ),
 
             suffix4(
                 s1_name,
-                c_name
+                candidate_name
             ),
 
             shared_tokens(
                 s1_name,
-                c_name
+                candidate_name
             ),
 
             weighted_overlap(
                 s1_name,
-                c_name,
+                candidate_name,
                 weights
             ),
 
@@ -523,22 +588,22 @@ def generate_features(pairs, split_name):
 
             prefix4(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             suffix4(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             shared_tokens(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             weighted_overlap(
                 s1_addr,
-                c_addr,
+                candidate_addr,
                 weights
             ),
 
@@ -548,60 +613,60 @@ def generate_features(pairs, split_name):
 
             number_overlap(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             first_number_match(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
 
             digit_similarity(
                 s1_addr,
-                c_addr
+                candidate_addr
             ),
         ]
 
-        output.append(features)
+        rows.append(features)
 
-        if i % 5000 == 0 or i == total:
+        if (
+            i % 5000 == 0
+            or i == total
+        ):
             print(
-                f"{split_name}: "
-                f"{i:,}/{total:,}"
+                f"Processed {i:,}/{total:,}"
             )
 
-    result = pd.DataFrame(
-        output,
+    return pd.DataFrame(
+        rows,
         columns=FEATURE_COLUMNS
     )
 
-    result["label"] = pairs["label"].to_numpy()
-
-    return result
-
 
 # ============================================================
-# TRAIN
+# GENERATE ALL FEATURES
 # ============================================================
 
-train_features = generate_features(
-    train_pairs,
-    "TRAIN"
+feature_df = calculate_features(
+    pair_data
 )
 
-print("\nTrain feature shape:", train_features.shape)
+feature_df["label"] = all_pairs["label"].to_numpy()
 
 
 # ============================================================
-# VALID
+# SPLIT TRAIN / VALID
 # ============================================================
 
-valid_features = generate_features(
-    valid_pairs,
-    "VALID"
-)
+train_count = len(train_pairs)
 
-print("\nValid feature shape:", valid_features.shape)
+train_features = feature_df.iloc[
+    :train_count
+].copy()
+
+valid_features = feature_df.iloc[
+    train_count:
+].copy()
 
 
 # ============================================================
@@ -620,30 +685,31 @@ valid_features.to_csv(
     index=False
 )
 
-
 print("\nSaved:")
-print(" ", TRAIN_OUT)
-print(" ", VALID_OUT)
+print(
+    f"  {TRAIN_OUT} -> "
+    f"{train_features.shape}"
+)
+
+print(
+    f"  {VALID_OUT} -> "
+    f"{valid_features.shape}"
+)
 
 
-print("\nFinal feature columns:")
+# ============================================================
+# SUMMARY
+# ============================================================
 
-for i, column in enumerate(FEATURE_COLUMNS):
+print("\nFeature list:")
+
+for i, name in enumerate(FEATURE_COLUMNS):
     print(
-        f"feature_{i}_{column}"
+        f"  feature_{i}_{name}"
     )
-
 
 print("\n" + "=" * 70)
 print("STEP 4.3 COMPLETE")
 print("=" * 70)
 
-print(
-    "Train:",
-    train_features.shape
-)
-
-print(
-    "Valid:",
-    valid_features.shape
-)
+con.close()
