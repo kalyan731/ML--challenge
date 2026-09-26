@@ -106,11 +106,11 @@ def main():
                 country_norm
 
             FROM source2,
-            LATERAL regexp_split_to_table(
+            LATERAL unnest(string_split(
                 lower(coalesce(name_norm, '') || ' ' ||
-                      coalesce(addr_norm, '')),
+                coalesce(addr_norm, '')),
                 '\\s+'
-            ) AS t(token)
+            )) AS t(token)
 
             WHERE length(token) >= 2
 
